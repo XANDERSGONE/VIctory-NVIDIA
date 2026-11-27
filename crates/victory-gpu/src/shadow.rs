@@ -535,8 +535,9 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers that lie in the card's memory
-/// and are filled by the CPU through the bus (`VICTORY_WINDOWS_BAR_MB`; 0, the
-/// default, none): one buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`), no CPU's side, no
+/// and are filled by the CPU through the bus (`VICTORY_WINDOWS_BAR_MB`; unset,
+/// [`windows_bar_default_mb`]: 3 GB on a PC with under 24 GB of RAM, else
+/// none; 0 turns it off): one buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`), no CPU's side, no
 /// copy to send and no list of changes, unlike [`window_card_most`]. The CPU
 /// only writes them, as no shader is declared to write a window; if one were,
 /// its snapshot and compare would read through the bus, right but slow. In a
@@ -548,8 +549,34 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let set = std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let mb = set.unwrap_or_else(|| {
+            let ram = crate::residency::total_host_ram();
+            let mb = windows_bar_default_mb(ram);
+            if mb > 0 {
+                tracing::info!(
+                    ram_gb = ram.unwrap_or(0) >> 30,
+                    mb,
+                    "under 24 GB of RAM: title memory windows in the card's memory the CPU maps \
+                     (VICTORY_WINDOWS_BAR_MB=0 turns this off)"
+                );
+            }
+            mb
+        });
+        mb << 20
     })
+}
+
+/// [`window_mapped_most`] in MiB when `VICTORY_WINDOWS_BAR_MB` is not set, for a
+/// PC with `ram` bytes of RAM: 3072 under 24 GB (PR #6), else 0. Windows lets a
+/// card share at most half the RAM, and the windows filled that on a 16 GB PC
+/// (RTX 3060) about a minute into the world: 0x8007000E, then a driver fault.
+/// 32 GB and more never got there. RAM that can't be read: 0.
+fn windows_bar_default_mb(ram: Option<u64>) -> u64 {
+    match ram {
+        Some(ram) if ram > 0 && ram < 24 << 30 => 3072,
+        _ => 0,
+    }
 }
 
 /// Bytes alive of windows in card memory the CPU maps.
@@ -5914,4 +5941,19 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod windows_bar_tests {
+    use super::windows_bar_default_mb;
+
+    #[test]
+    fn under_24_gb_of_ram_gets_3_gb_of_mapped_windows() {
+        assert_eq!(windows_bar_default_mb(Some(16 << 30)), 3072);
+        assert_eq!(windows_bar_default_mb(Some((24 << 30) - 1)), 3072);
+        assert_eq!(windows_bar_default_mb(Some(24 << 30)), 0);
+        assert_eq!(windows_bar_default_mb(Some(32 << 30)), 0);
+        assert_eq!(windows_bar_default_mb(Some(0)), 0);
+        assert_eq!(windows_bar_default_mb(None), 0);
+    }
 }
