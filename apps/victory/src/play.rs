@@ -808,6 +808,20 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     {
         s.insert("VICTORY_MFG_UNLOCKER_DLL".to_owned(), dll.to_string_lossy().into_owned());
     }
+    // The card memory held back for frame generation (VICTORY_TEXTURE_ROOM_PERCENT 80 or 86,
+    // about 0.5 to 1 GB of a 12 GB card) is given back to textures where none can run: DLSS
+    // frame generation asked of a card without it and no MFG Unlocker, and FSR 3 not asked,
+    // its files not found, or Series X without DLSS upscaling. A value the menu or --set gave
+    // stays.
+    let room_set = menu.iter().any(|(k, _)| k == "VICTORY_TEXTURE_ROOM_PERCENT")
+        || o.more.iter().filter_map(|m| m.split_once('=')).any(|(k, _)| k.trim() == "VICTORY_TEXTURE_ROOM_PERCENT");
+    if !room_set && s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT") {
+        let card = victory_hle::streamline::adapter_name().unwrap_or_default();
+        if !framegen_can_run(&s, series_s, &card, !mods.is_empty()) {
+            s.remove("VICTORY_TEXTURE_ROOM_PERCENT");
+            println!("No frame generation can run here: its card memory is left to textures.");
+        }
+    }
     // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
     // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
     // exe's first run stays at about 14 fps. `--set VICTORY_WARMUP_RESTART=0`: not done.
@@ -858,6 +872,21 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     Ok(Ready { exe, series_s })
 }
 
+/// Whether any frame generation the settings `s` ask for can run on the card named `card`:
+/// DLSS frame generation on an RTX 40 or 50, or on another card with MFG Unlocker on or a
+/// mod DLL beside this program (`mods`); FSR 3 with AMD's files found, on Series S or with
+/// DLSS upscaling (Series X). The layer decides at the start; this is only for what the
+/// launcher holds back for it. An unknown card counts as able.
+fn framegen_can_run(s: &BTreeMap<String, String>, series_s: bool, card: &str, mods: bool) -> bool {
+    let on = |k: &str| s.get(k).is_some_and(|v| v == "1");
+    let dlss_fg = on("VICTORY_FRAMEGEN")
+        && (card.is_empty() || victory_hle::streamline::dlss_framegen_card(card) || on("VICTORY_MFG_UNLOCKER") || mods);
+    let fsr_fg = on("VICTORY_FSR_FRAMEGEN")
+        && s.contains_key("VICTORY_FIDELITYFX_DIR")
+        && (series_s || on("VICTORY_DLSS"));
+    dlss_fg || fsr_fg
+}
+
 /// After a start that went wrong in a window of its own (a double click):
 /// the text stays until a key is pressed.
 pub(crate) fn hold_window() {
@@ -885,6 +914,30 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn frame_generation_that_cannot_run_is_told_apart() {
+        let with = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+        };
+        let dlss_fg = with(&[("VICTORY_DLSS", "1"), ("VICTORY_FRAMEGEN", "1")]);
+        assert!(framegen_can_run(&dlss_fg, false, "NVIDIA GeForce RTX 5070", false));
+        assert!(!framegen_can_run(&dlss_fg, false, "NVIDIA GeForce RTX 3080", false));
+        assert!(framegen_can_run(&dlss_fg, false, "NVIDIA GeForce RTX 3080", true));
+        assert!(framegen_can_run(&dlss_fg, false, "", false));
+        let mut unlocked = dlss_fg.clone();
+        unlocked.insert("VICTORY_MFG_UNLOCKER".to_owned(), "1".to_owned());
+        assert!(framegen_can_run(&unlocked, false, "NVIDIA GeForce RTX 3080", false));
+        // FSR 3: its files found, and on Series X DLSS upscaling on
+        let fsr_no_files = with(&[("VICTORY_DLSS", "1"), ("VICTORY_FSR_FRAMEGEN", "1")]);
+        assert!(!framegen_can_run(&fsr_no_files, false, "NVIDIA GeForce RTX 3080", false));
+        let fsr = with(&[("VICTORY_DLSS", "1"), ("VICTORY_FSR_FRAMEGEN", "1"), ("VICTORY_FIDELITYFX_DIR", "x")]);
+        assert!(framegen_can_run(&fsr, false, "NVIDIA GeForce RTX 3080", false));
+        let fsr_x_no_dlss = with(&[("VICTORY_FSR_FRAMEGEN", "1"), ("VICTORY_FIDELITYFX_DIR", "x")]);
+        assert!(!framegen_can_run(&fsr_x_no_dlss, false, "NVIDIA GeForce RTX 3080", false));
+        assert!(framegen_can_run(&fsr_x_no_dlss, true, "NVIDIA GeForce RTX 3080", false));
+        assert!(!framegen_can_run(&with(&[]), false, "NVIDIA GeForce RTX 5070", false));
     }
 
     #[test]
