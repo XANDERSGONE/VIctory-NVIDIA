@@ -115,6 +115,8 @@ const KEPT: &[&str] = &[
     "VICTORY_STREAMLINE_DIR",
     "VICTORY_FIDELITYFX_DIR",
     "VICTORY_LOG",
+    // The card to run on, on a PC with more than one (part of its name, or #index)
+    "VICTORY_ADAPTER",
 ];
 
 const FG_TYPES: [&str; 3] = ["auto", "dlss", "fsr"];
