@@ -1524,7 +1524,22 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
-    let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
+    make_waiting_of(take_made());
+}
+
+/// The textures given their host copy since the last call (or the last
+/// [`make_waiting`]), for [`make_waiting_of`] later: a submission handed to
+/// the thread that sends it takes them when it is handed over, so that
+/// textures made while later ones are prepared wait for those
+/// (`VICTORY_SEND_THREAD=2`).
+#[cfg(windows)]
+pub(crate) fn take_made() -> Vec<usize> {
+    std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// [`make_waiting`] for the textures `made` ([`take_made`]).
+#[cfg(windows)]
+pub(crate) fn make_waiting_of(made: Vec<usize>) {
     for resource in made {
         let handles = WAITING
             .lock()
