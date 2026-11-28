@@ -155,6 +155,9 @@ const ITEMS: &[Item] = &[
     Item { var: "VICTORY_AMBIENT_SPECULAR", label: "REFLECTION ESTIMATE", values: ON_UNSET, live: false },
     Item { var: "VICTORY_AMBIENT_AIR", label: "FOG CAP", values: &[("1.5", "1.5"), ("1", "1"), ("2", "2"), ("", "NONE")], live: false },
     Item { var: "VICTORY_BVH_BUILDER", label: "RAY TRACING (SLOW, BROKEN)", values: UNSET_ON, live: false },
+    // Reflex by itself (`streamline::reflex`): its sleep and the frame's own markers. Needs DLSS or frame
+    // generation on, which load Streamline.
+    Item { var: "VICTORY_REFLEX", label: "REFLEX (UNTESTED)", values: &[("", "OFF"), ("on", "ON"), ("boost", "ON + BOOST")], live: false },
     // On unless "0": a file saved by an earlier version holds an empty value (its OFF) or "1",
     // and both start it on, so nobody keeps it off from before by accident (2026-11-27).
     Item { var: "VICTORY_WATER_LIGHT", label: "WATER LIGHT", values: &[("", "ON"), ("0", "OFF")], live: false },

@@ -54,6 +54,9 @@ pub const DLSS_OPTIMAL_SETTINGS: StructType =
 pub const DLSSG_OPTIONS: StructType = guid(0xfac5_f1cb, 0x2dfd, 0x4f36, [0xa1, 0xe6, 0x3a, 0x9e, 0x86, 0x52, 0x56, 0xc5]);
 pub const DLSSG_STATE: StructType = guid(0xcc8a_c8e1, 0xa179, 0x44f5, [0x97, 0xfa, 0xe7, 0x41, 0x12, 0xf9, 0xbc, 0x61]);
 pub const REFLEX_OPTIONS: StructType = guid(0xf03a_f81a, 0x6d0b, 0x4902, [0xa6, 0x51, 0xc4, 0x96, 0x5e, 0x21, 0x54, 0x34]);
+pub const REFLEX_REPORT: StructType = guid(0x0d56_9b37, 0xa1c8, 0x4453, [0xbe, 0x4d, 0x40, 0xf4, 0xde, 0x57, 0x95, 0x2b]);
+pub const REFLEX_REPORT2: StructType = guid(0x68bb_0632, 0x5e1c, 0x402b, [0x89, 0x9d, 0xb4, 0x9f, 0x63, 0x3c, 0x56, 0xc2]);
+pub const REFLEX_STATE: StructType = guid(0xf0bb_5985, 0xdaf9, 0x4728, [0xb2, 0xfd, 0xae, 0x80, 0xa2, 0xbd, 0x79, 0x89]);
 
 /// `sl::kSDKVersion` of the headers mirrored here (2.14.16).
 pub const SDK_VERSION: u64 = (2 << 48) | (14 << 32) | (16 << 16) | 0xfedc;
@@ -138,6 +141,12 @@ pub const RENDER_SUBMIT_START: u32 = 2;
 pub const RENDER_SUBMIT_END: u32 = 3;
 pub const PRESENT_START: u32 = 4;
 pub const PRESENT_END: u32 = 5;
+// (6, the general input sample, is struck out of `sl_pcl.h` as deprecated;
+// the controller's is the one input sample the header still has.)
+pub const CONTROLLER_INPUT_SAMPLE: u32 = 13;
+
+/// `sl::kReflexFrameReportCount`: the frames a Reflex state reports on.
+pub const REFLEX_FRAME_REPORTS: usize = 64;
 
 /// `sl::Preferences` (version 1).
 #[repr(C)]
@@ -541,6 +550,97 @@ pub struct ReflexOptions {
     pub id_thread: u32,
 }
 
+/// `sl::ReflexReport` (version 1): the times of one frame as the driver saw
+/// them. The header names no unit for the time stamps; the two durations at
+/// the end are in microseconds by their names.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReflexReport {
+    pub base: BaseStructure,
+    pub frame_id: u64,
+    pub input_sample_time: u64,
+    pub sim_start_time: u64,
+    pub sim_end_time: u64,
+    pub render_submit_start_time: u64,
+    pub render_submit_end_time: u64,
+    pub present_start_time: u64,
+    pub present_end_time: u64,
+    pub driver_start_time: u64,
+    pub driver_end_time: u64,
+    pub os_render_queue_start_time: u64,
+    pub os_render_queue_end_time: u64,
+    pub gpu_render_start_time: u64,
+    pub gpu_render_end_time: u64,
+    pub gpu_active_render_time_us: u32,
+    pub gpu_frame_time_us: u32,
+}
+
+impl ReflexReport {
+    /// An empty report, as the header's constructor leaves it.
+    pub const fn empty() -> Self {
+        ReflexReport {
+            base: BaseStructure::new(REFLEX_REPORT, 1),
+            frame_id: 0,
+            input_sample_time: 0,
+            sim_start_time: 0,
+            sim_end_time: 0,
+            render_submit_start_time: 0,
+            render_submit_end_time: 0,
+            present_start_time: 0,
+            present_end_time: 0,
+            driver_start_time: 0,
+            driver_end_time: 0,
+            os_render_queue_start_time: 0,
+            os_render_queue_end_time: 0,
+            gpu_render_start_time: 0,
+            gpu_render_end_time: 0,
+            gpu_active_render_time_us: 0,
+            gpu_frame_time_us: 0,
+        }
+    }
+}
+
+/// `sl::ReflexReport2` (version 1): what version 2 of the state adds for
+/// each frame.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ReflexReport2 {
+    pub base: BaseStructure,
+    pub camera_constructed_time: u64,
+    pub cross_adapter_copy_time_us: u32,
+}
+
+/// `sl::ReflexState` (version 2). The header's `bool`s are bytes here: the
+/// library writes them, and only zero or not is read.
+#[repr(C)]
+pub struct ReflexState {
+    pub base: BaseStructure,
+    pub low_latency_available: u8,
+    pub latency_report_available: u8,
+    pub stats_window_message: u32,
+    pub frame_report: [ReflexReport; REFLEX_FRAME_REPORTS],
+    pub flash_indicator_driver_controlled: u8,
+    pub frame_report2: [ReflexReport2; REFLEX_FRAME_REPORTS],
+}
+
+impl ReflexState {
+    /// A state to fill, every report in it with its own header as the
+    /// header's constructors make them. Boxed: it is 12,848 bytes.
+    pub fn new() -> Box<Self> {
+        let report2 =
+            ReflexReport2 { base: BaseStructure::new(REFLEX_REPORT2, 1), camera_constructed_time: 0, cross_adapter_copy_time_us: 0 };
+        Box::new(ReflexState {
+            base: BaseStructure::new(REFLEX_STATE, 2),
+            low_latency_available: 0,
+            latency_report_available: 0,
+            stats_window_message: 0,
+            frame_report: [ReflexReport::empty(); REFLEX_FRAME_REPORTS],
+            flash_indicator_driver_controlled: 0,
+            frame_report2: [report2; REFLEX_FRAME_REPORTS],
+        })
+    }
+}
+
 /// An opaque `sl::FrameToken` (a structure with a virtual table).
 pub type FrameToken = c_void;
 
@@ -570,6 +670,8 @@ pub type SlDlssSetOptions = unsafe extern "C" fn(*const ViewportHandle, *const D
 pub type SlDlssgSetOptions = unsafe extern "C" fn(*const ViewportHandle, *const DlssgOptions) -> i32;
 pub type SlDlssgGetState = unsafe extern "C" fn(*const ViewportHandle, *mut DlssgState, *const DlssgOptions) -> i32;
 pub type SlReflexSetOptions = unsafe extern "C" fn(*const ReflexOptions) -> i32;
+pub type SlReflexSleep = unsafe extern "C" fn(*const FrameToken) -> i32;
+pub type SlReflexGetState = unsafe extern "C" fn(*mut ReflexState) -> i32;
 pub type SlPclSetMarker = unsafe extern "C" fn(u32, *const FrameToken) -> i32;
 
 /// The name of an `sl::Result`, for the log.
@@ -661,6 +763,19 @@ mod tests {
         assert_eq!(offset_of!(DlssgState, is_dynamic_mfg_supported), 80);
         assert_eq!(offset_of!(ReflexOptions, virtual_key), 42);
         assert_eq!(size_of::<ReflexOptions>(), 48);
+        // The Reflex state: 64 reports of 152 bytes behind two flags and a
+        // message id, one more flag, 64 reports of 48 bytes.
+        assert_eq!(offset_of!(ReflexReport, gpu_render_end_time), 136);
+        assert_eq!(offset_of!(ReflexReport, gpu_frame_time_us), 148);
+        assert_eq!(size_of::<ReflexReport>(), 152);
+        assert_eq!(offset_of!(ReflexReport2, cross_adapter_copy_time_us), 40);
+        assert_eq!(size_of::<ReflexReport2>(), 48);
+        assert_eq!(offset_of!(ReflexState, latency_report_available), 33);
+        assert_eq!(offset_of!(ReflexState, stats_window_message), 36);
+        assert_eq!(offset_of!(ReflexState, frame_report), 40);
+        assert_eq!(offset_of!(ReflexState, flash_indicator_driver_controlled), 9768);
+        assert_eq!(offset_of!(ReflexState, frame_report2), 9776);
+        assert_eq!(size_of::<ReflexState>(), 12848);
         assert_eq!(size_of::<Resource>(), 112);
         assert_eq!(size_of::<ResourceTag>(), 64);
     }
