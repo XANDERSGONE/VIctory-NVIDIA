@@ -672,8 +672,9 @@ pub fn device_shader_model(device: &ID3D12Device) -> Option<(u32, u32)> {
     .or(Some((5, 1)))
 }
 
-/// The highest shader model of the default adapter (the one the title's device is
-/// on), from a device made for the question; `None` without one. Windows 10's own
+/// The highest shader model of the card the title's device is on
+/// (`hardware_adapter`, else the first adapter), from a device made for the
+/// question; `None` without one. Windows 10's own
 /// Direct3D 12 stops at 6.5; Microsoft's newer runtime (`D3D12\D3D12Core.dll`
 /// beside the program, which victory.exe asks for) runs 6.6. Made in a process of
 /// its own (`victory shader-model`), since a process keeps the first runtime it loads.
@@ -681,8 +682,13 @@ pub fn highest_shader_model() -> Option<(u32, u32)> {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     // SAFETY: plain DXGI and D3D12 calls with owned results.
     let device = unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        let adapter = factory.EnumAdapters1(0).ok()?;
+        let adapter = match victory_shader::emit::host::hardware_adapter() {
+            Some((adapter, ..)) => adapter,
+            None => {
+                let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+                factory.EnumAdapters1(0).ok()?
+            }
+        };
         let mut device: Option<ID3D12Device> = None;
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
         device?
