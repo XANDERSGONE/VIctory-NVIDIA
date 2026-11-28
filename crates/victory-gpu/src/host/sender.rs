@@ -289,6 +289,10 @@ thread_local! {
 /// lists; on the threads that give and drain: microseconds waited for
 /// room, drains that waited, microseconds of those.
 static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// The fence value of the last submission sent ([`Host::send_run`]).
+static LAST: AtomicU64 = AtomicU64::new(0);
+/// Submissions that reached the sender with a value not above the last.
+static OUT_OF_ORDER: AtomicU64 = AtomicU64::new(0);
 const SENT: usize = 0;
 const LISTS: usize = 1;
 const SENDING: usize = 2;
@@ -427,6 +431,14 @@ impl Host {
             // lists that may read them run.
             crate::descriptor::make_waiting_of(made);
             STATS[HEAPS].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+        }
+        // Each value above the last one sent: given in the order they were
+        // taken, under the submission lock. Said if not, and sent anyway (held
+        // back, its flight would never land). After the same check in
+        // Kemerd's send thread (upstream PR 18).
+        let last = LAST.swap(value, Relaxed);
+        if value <= last && OUT_OF_ORDER.fetch_add(1, Relaxed) < 4 {
+            tracing::warn!(value, last, "a submission reached the sender out of order (VICTORY_SEND_THREAD)");
         }
         let _sending = crate::timeline::span("sender: sending");
         let began = Instant::now();
