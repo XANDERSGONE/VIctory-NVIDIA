@@ -79,6 +79,7 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
             "VICTORY_MEMORY_NEAR",
+            "VICTORY_WATER_TILE_SLOTS",
             "VICTORY_THREAD_TICKET",
             "VICTORY_LDS_LOOP_ATOMICS",
             "VICTORY_LDS_BOUNDS",
