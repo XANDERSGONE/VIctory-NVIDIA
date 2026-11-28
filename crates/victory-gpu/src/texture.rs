@@ -1149,7 +1149,7 @@ fn fill_plane(
     bytes: usize,
     pitch: usize,
 ) {
-    let _pin = crate::watch::title_memory_reading();
+    let _pin = crate::watch::title_memory_reading_range(at..at.saturating_add(len));
     // SAFETY: the list owns this full upload allocation until its GPU work completes.
     let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
     let mip = &layout.mips[0];
@@ -1512,17 +1512,19 @@ impl Staging {
         // only with this taken alone, so what `committed` finds mapped
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
-        // 74).
+        // 74). Of the texture's own memory alone: a change elsewhere does
+        // not hold the refresh up, nor send it through the kernel
+        // (`crate::watch::mapping_ranges`).
         let _mapped = if no_wait() && !exact {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_range_now(start..start + size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else if exact && exact_unlocked() {
-            match crate::watch::title_memory_reading_now() {
+            match crate::watch::title_memory_reading_range_now(start..start + size) {
                 Some(mapped) => mapped,
                 None => match self.refresh_exact_unlocked(last, size) {
                     Some(read) => {
@@ -1531,11 +1533,11 @@ impl Staging {
                         }
                         return size;
                     }
-                    None => waited(2, crate::watch::title_memory_reading),
+                    None => waited(2, || crate::watch::title_memory_reading_range(start..start + size)),
                 },
             }
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start..start + size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages

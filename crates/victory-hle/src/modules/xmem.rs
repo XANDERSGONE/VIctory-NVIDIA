@@ -528,6 +528,27 @@ struct Physical {
 }
 
 impl Physical {
+    /// The addresses an unmapping of `[base, end)` ([`unmap`], [`change`])
+    /// may take away for its moment: the range itself and the whole of each
+    /// view it cuts into, which goes and is mapped again without the part
+    /// unmapped. (Views do not overlap: the one holding `base`, and the last
+    /// starting before `end`, are the only ones reaching outside.)
+    fn unmap_extent(&self, base: usize, end: usize) -> std::ops::Range<usize> {
+        let start = self
+            .views
+            .range(..=base)
+            .next_back()
+            .filter(|(at, (size, _))| *at + size > base)
+            .map_or(base, |(&at, _)| at);
+        let end = self.views.range(..end).next_back().map_or(end, |(&at, (size, _))| end.max(at + size));
+        start..end
+    }
+
+    /// [`Physical::unmap_extent`] of a page at each of `pages`.
+    fn page_extents(&self, pages: impl Iterator<Item = usize>) -> Vec<std::ops::Range<usize>> {
+        pages.map(|at| self.unmap_extent(at, at.saturating_add(PAGE))).collect()
+    }
+
     /// What the page at `at` shows.
     fn slice_at(&self, at: usize) -> Option<Slice> {
         self.views
@@ -1325,12 +1346,18 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, lazy: bool) ->
     // into that gap (`victory_gpu::title_memory_remapping`). Taken before
     // the views, as everywhere: a reader that holds it may fault into a
     // lazy view and need the views to make it real ([`materialize`]).
-    let _changing = victory_gpu::title_memory_remapping();
+    // Only the reads of what the change takes away wait, and it for them
+    // (`victory_gpu::title_memory_remapping_where`): the views are looked
+    // at for that and let go before it waits.
+    let len = n.saturating_mul(PAGE);
+    let _changing = victory_gpu::title_memory_remapping_where(|| {
+        vec![physical().unmap_extent(base, base.saturating_add(len))]
+    });
     let mut physical = physical();
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
     }
-    unmap(&mut physical, base, n * PAGE);
+    unmap(&mut physical, base, len);
     let Some(pages) = pages else {
         return address;
     };
@@ -1425,8 +1452,10 @@ fn alias_as(to: u64, from: u64, len: u64, runs_in_one: bool, lazy: bool) -> bool
     let lazy = lazy.then_some(Soft::NotedCopies);
     let _busy = Busy::begin();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap (taken
-    // before the views, as there).
-    let _changing = victory_gpu::title_memory_remapping();
+    // before the views, as there; what the change takes away, as there).
+    let _changing = victory_gpu::title_memory_remapping_where(|| {
+        vec![physical().unmap_extent(to, to.saturating_add(len))]
+    });
     let mut physical = physical();
     unmap(&mut physical, to, len);
     if from == 0 {
@@ -1597,7 +1626,10 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let mut at = 0;
     while at < pages.len() {
         let _busy = Busy::begin();
-        let _changing = victory_gpu::title_memory_remapping();
+        // (The group is at most the next `GROUP` pages.)
+        let _changing = victory_gpu::title_memory_remapping_where(|| {
+            physical().page_extents(pages[at..].iter().take(GROUP).map(|p| p.0))
+        });
         let mut physical = physical();
         let mut ops: Vec<Op> = Vec::new();
         let mut touched = std::collections::HashSet::new();
@@ -1627,7 +1659,10 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         let _busy = Busy::begin();
         let mut costed = Costed::begin(None);
         let mut ops: Vec<Op> = Vec::new();
-        let _changing = victory_gpu::title_memory_remapping();
+        // (The group is at most the next `GROUP` pages.)
+        let _changing = victory_gpu::title_memory_remapping_where(|| {
+            physical().page_extents(wanted[at..].iter().take(GROUP).map(|w| w.0))
+        });
         let mut physical = physical();
         if let Some(costed) = &mut costed {
             costed.waited = costed.started.elapsed().as_nanos() as u64;
@@ -3441,6 +3476,54 @@ mod tests {
         assert!(reader.join().expect("the reader never faulted") > 0);
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    /// Mapping one page in the middle of a view takes the whole view away
+    /// for its moment (`unmap` maps what stays again), so it waits for a
+    /// read in place of the view's first page; a read of another view does
+    /// not hold it up (`victory_gpu::title_memory_remapping_where`). With
+    /// `VICTORY_MAPPING_RANGES=0` every read holds every change up.
+    #[test]
+    fn a_remapping_waits_for_reads_of_the_views_it_cuts_into_alone() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let mut pages = [0usize; 4];
+        let mut n = 4;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = |len| XMemVirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (a, b) = (reserve(3 * PAGE), reserve(PAGE));
+        assert!(!a.is_null() && !b.is_null());
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, &pages[3]), b);
+        let (first, middle, other) = (a as usize, a as usize + PAGE, b as usize);
+        assert_eq!(physical().unmap_extent(middle, middle + PAGE), first..first + 3 * PAGE);
+        assert_eq!(physical().unmap_extent(other, other + PAGE), other..other + PAGE);
+        let remap_middle = || {
+            let (done, ended) = mpsc::channel();
+            let page = pages[1];
+            let mapper = std::thread::spawn(move || {
+                done.send(XMemMapPhysicalPages(middle as *mut c_void, 1, &page) as usize).unwrap();
+            });
+            (mapper, ended)
+        };
+        // A read of the other view: the change goes ahead.
+        let elsewhere = victory_gpu::title_memory_reading_range(other..other + PAGE);
+        let (mapper, ended) = remap_middle();
+        let waited = ended.recv_timeout(Duration::from_millis(500)).is_err();
+        assert_eq!(waited, !victory_gpu::mapping_ranges(), "a read of another view held the change up");
+        drop(elsewhere);
+        assert_eq!(ended.recv().unwrap(), middle);
+        mapper.join().unwrap();
+        // A read of the view's first page: the change waits for it.
+        let reading = victory_gpu::title_memory_reading_range(first..first + 1);
+        let (mapper, ended) = remap_middle();
+        assert!(ended.recv_timeout(Duration::from_millis(200)).is_err(), "the view went under a read in place");
+        drop(reading);
+        assert_eq!(ended.recv().unwrap(), middle);
+        mapper.join().unwrap();
+        assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
+        assert_eq!(XMemMapPhysicalPages(b, 1, std::ptr::null()), b);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
     }
 
     /// A title thread that reads and writes a page of a view while other
