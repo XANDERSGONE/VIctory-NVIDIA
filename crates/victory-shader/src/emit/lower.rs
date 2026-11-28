@@ -291,6 +291,12 @@ struct Lower<'a> {
     root_copy: Option<V>,
     /// Whether the page [`Lower::memory`] last looked for has a copy.
     page_there: Option<V>,
+    /// The looks in the directory of title memory that loads of a program
+    /// that walks have made so far ([`Lower::memory_near`]), in the order
+    /// they were lowered.
+    looks: Vec<Look>,
+    /// The IR blocks' immediate dominators, once a load asked for them.
+    idom: Option<Vec<usize>>,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -412,6 +418,30 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+}
+
+/// One look in the directory of title memory ([`Lower::memory_near`]): what
+/// a later load of the same 64 KiB page needs in place of a look of its own.
+#[derive(Clone, Copy)]
+struct Look {
+    /// The IR block whose code made it. (Its values are made at the top of
+    /// that block's code, in no branch of an instruction's own: they hold in
+    /// every block that one dominates.)
+    ir: usize,
+    /// The address registers' values the load named, before its offset.
+    base: (V, V),
+    /// The page's number (clamped: its entry in the directory).
+    page: V,
+    /// The heap slot of the copy's view and the page's first byte in it.
+    slot: V,
+    start: V,
+    /// Whether the page has a copy.
+    there: V,
+    /// The host block `slot` and `start` are made in (not in a branch of an
+    /// instruction's own), and the handle of the view at `slot` if that
+    /// block has one.
+    home: usize,
+    view: Option<V>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1495,6 +1525,14 @@ fn ticket_on() -> bool {
     std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
 }
 
+/// Whether an image instruction whose sampler a uniform branch picks from two immediate
+/// samplers is translated as two samples and a select ([`Lower::image`]). Part of the
+/// translation: the shader cache keys on `VICTORY_SAMPLER_CHOICE`.
+fn sampler_choice_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_CHOICE").is_none_or(|v| v != "0"))
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -2011,6 +2049,8 @@ impl<'a> Lower<'a> {
             coherent: HashSet::new(),
             root_copy: None,
             page_there: None,
+            looks: Vec::new(),
+            idom: None,
             ordered: if x.native.stage == HwStage::Ps {
                 ordered_section(p)
             } else {
@@ -3509,9 +3549,18 @@ impl<'a> Lower<'a> {
     /// With `store`, a page that is not to be written ([`super::shader::MEMORY_READ_ONLY`])
     /// is the null view.
     fn memory(&mut self, lo: V, hi: V, guard: Option<V>, store: bool) -> (V, V) {
-        use super::shader::{MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        let page = self.memory_page(lo, hi);
+        let (slot, start, there) = self.memory_entry(page, guard, store);
+        self.page_there = Some(there);
+        self.memory_view(slot, start, lo)
+    }
+
+    /// The number of the 64 KiB page of the address `lo`, `hi`: its entry in
+    /// the directory.
+    fn memory_page(&mut self, lo: V, hi: V) -> V {
+        use super::shader::MEMORY_PAGES;
         let c = self.cur;
-        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let i32t = self.s.t.i32;
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let (k16, k8) = (k(self, 16), k(self, 0xFF));
         let low = self.s.m.bin(c, Bin::LShr, lo, k16);
@@ -3525,6 +3574,20 @@ impl<'a> Lower<'a> {
             .s
             .op(c, "binary.i32", Attr::ReadNone, i32t, 40, &[page, last]);
         self.s.m.tag(page, Tag::Clamp);
+        page
+    }
+
+    /// The look in the directory for `page` ([`Lower::memory_page`]): the heap
+    /// slot of the view of the copy that holds it (the null view's without a
+    /// copy, and with `store` for a page that is not to be written), the
+    /// page's first byte in that view, and whether there is a copy. Leaves
+    /// the number of a page without one for the host, for lanes that run
+    /// (`guard`). Goes on in another block.
+    fn memory_entry(&mut self, page: V, guard: Option<V>, store: bool) -> (V, V, V) {
+        use super::shader::{MEMORY_FAULTS, MEMORY_READ_ONLY, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
+        let c = self.cur;
+        let (i32t, res) = (self.s.t.i32, self.s.t.res_ret);
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
         let k3 = k(self, 3);
         let at = self.s.m.bin(c, Bin::Shl, page, k3);
         let directory = self.s.root_srv_handle(SLOT_MEMORY);
@@ -3570,7 +3633,7 @@ impl<'a> Lower<'a> {
         );
         self.end_guarded(noting, &[]);
         let c = self.cur;
-        self.page_there = Some(self.s.m.cmp(c, pred::NE, copy, zero));
+        let there = self.s.m.cmp(c, pred::NE, copy, zero);
         let copy = if store {
             let closed = self.s.m.cmp(c, pred::SLT, number, zero);
             self.s.m.select(c, closed, zero, copy)
@@ -3579,14 +3642,250 @@ impl<'a> Lower<'a> {
         };
         let base = self.host_word(RootType::Other(USER_MEMORY_BASE), 0, 0);
         let slot = self.s.m.bin(c, Bin::Add, base, copy);
+        (slot, start, there)
+    }
+
+    /// The raw view at heap slot `slot` and the byte in it of the address
+    /// whose low dword is `lo`, for a page that begins at byte `start` there
+    /// ([`Lower::memory_entry`]).
+    fn memory_view(&mut self, slot: V, start: V, lo: V) -> (V, V) {
+        let c = self.cur;
         // The builder's threads read what others of the dispatch wrote (a
         // refit climbs from children to parents): globally coherent.
         let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
         let h = self.s.heap_handle(c, slot, false, true, (11 | 0x1000 | coherent, 0));
-        let k64k = k(self, 0xFFFF);
+        let k64k = self.s.m.i32(0xFFFF);
         let within = self.s.m.bin(c, Bin::And, lo, k64k);
         let byte = self.s.m.bin(c, Bin::Add, start, within);
         (h, byte)
+    }
+
+    /// Whether this program's loads by address share their looks in the
+    /// directory ([`Lower::memory_near`]): the programs that walk the
+    /// title's structures. Not the structure builder's (they also store, and
+    /// are not what a frame's time goes to), and not with
+    /// `VICTORY_MEMORY_NEAR=0`.
+    fn memory_shares(&self) -> bool {
+        super::memory_near() && !crate::spill::is_spilled(self.x.native)
+    }
+
+    /// [`Lower::memory`] for a read of a program that walks the title's
+    /// structures; `base` is what names the address before the
+    /// instruction's offset (its address registers' values).
+    ///
+    /// A read of the page an earlier read looked up takes that look's copy
+    /// and start: no load from the directory, no test for a missing page.
+    /// The walkers read a record with one instruction a dword or two (an
+    /// instance's matrix is eight loads from one register pair; the dwords
+    /// after a node's boxes come right behind its test), and every one was a
+    /// look of its own: a clamp, two dwords out of the 16 MB directory, the
+    /// test, a view picked from the heap by a per-lane index, then the read.
+    /// Run 410: the five walkers were 30 of the card's 85 ms a frame.
+    ///
+    /// Which earlier look ([`Lower::look_before`]): one whose code every lane
+    /// has run before this read (its block is this one or dominates it),
+    /// from this turn of the loop if the read is in one. The pages are
+    /// compared when the shader runs, so the choice only decides how often
+    /// the short way is taken, never what is read: the same page is the same
+    /// entry of the directory, which no shader writes. A page without a copy
+    /// takes the whole look, so its note is left as before, for the lanes
+    /// that run this read.
+    ///
+    /// This form gives a view's handle, for the node test's own loads; it
+    /// saves the look but picks the view anew (a handle cannot be joined).
+    /// [`Lower::memory_near_words`] reads through the earlier look's view.
+    fn memory_near(&mut self, lo: V, hi: V, base: (V, V), guard: Option<V>) -> (V, V) {
+        if !self.memory_shares() {
+            return self.memory(lo, hi, guard, false);
+        }
+        let page = self.memory_page(lo, hi);
+        let (slot, start, there) = match self.look_before(base) {
+            None => self.memory_entry(page, guard, false),
+            Some(earlier) => {
+                let look = self.looks[earlier];
+                let head = self.cur;
+                let same = self.s.m.cmp(head, pred::EQ, page, look.page);
+                let near = self.s.m.bin(head, Bin::And, same, look.there);
+                let (far, join) = (self.s.m.new_block(), self.s.m.new_block());
+                self.s.m.terminate(head, Term::CondBr(near, join, far));
+                self.cur = far;
+                let (slot, start, there) = self.memory_entry(page, guard, false);
+                let far_end = self.cur;
+                self.s.m.terminate(far_end, Term::Br(join));
+                self.cur = join;
+                self.memory_joined(join, (head, look.slot, look.start, look.there), (far_end, slot, start, there))
+            }
+        };
+        self.page_there = Some(there);
+        let (view, byte) = self.memory_view(slot, start, lo);
+        self.looks.push(Look {
+            ir: self.cur_ir,
+            base,
+            page,
+            slot,
+            start,
+            there,
+            home: self.cur,
+            view: Some(view),
+        });
+        (view, byte)
+    }
+
+    /// The slot, the start and "there is a copy" of a look at `join`, from
+    /// the earlier look's (coming from block `near.0`) and this read's own
+    /// (from `far.0`).
+    fn memory_joined(&mut self, join: usize, near: (usize, V, V, V), far: (usize, V, V, V)) -> (V, V, V) {
+        let (i32t, i1t) = (self.s.t.i32, self.s.t.i1);
+        let mut joined = |ty, a: V, b: V| {
+            let phi = self.s.m.phi(join, ty);
+            self.s.m.set_phi(phi, vec![(a, near.0), (b, far.0)]);
+            phi
+        };
+        (joined(i32t, near.1, far.1), joined(i32t, near.2, far.2), joined(i1t, near.3, far.3))
+    }
+
+    /// `n` dwords at `byte` of the raw view `h`, read by one call.
+    fn memory_words(&mut self, h: V, byte: V, n: u8) -> Vec<V> {
+        let c = self.cur;
+        let (iu, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mask = self.s.m.i8((1u8 << n) - 1);
+        let r = self.s.op(
+            c,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, iu, mask, align],
+        );
+        (0..n)
+            .map(|k| {
+                let x = self.s.m.extract(c, r, u32::from(k));
+                self.as_int(x)
+            })
+            .collect()
+    }
+
+    /// The `n` dwords at the address `lo`, `hi` of title memory, for a
+    /// program that walks ([`Lower::memory_shares`]); see
+    /// [`Lower::memory_near`]. Where the page is the one of an earlier look
+    /// the dwords are read through that look's view: no look, and for a
+    /// look that has its view's handle no view picked from the heap again.
+    /// The whole look and its read stand in a branch of their own for every
+    /// other page.
+    ///
+    /// The view of an earlier look that was itself joined of two (it has no
+    /// handle: one cannot be joined): for a read from the same address
+    /// registers it is made once where that look was joined, for all the
+    /// reads of the record; for any other read, in the short branch alone.
+    fn memory_near_words(&mut self, lo: V, hi: V, base: (V, V), guard: Option<V>, n: u8) -> Vec<V> {
+        let page = self.memory_page(lo, hi);
+        let Some(earlier) = self.look_before(base) else {
+            let (slot, start, there) = self.memory_entry(page, guard, false);
+            self.page_there = Some(there);
+            let (view, byte) = self.memory_view(slot, start, lo);
+            self.looks.push(Look {
+                ir: self.cur_ir,
+                base,
+                page,
+                slot,
+                start,
+                there,
+                home: self.cur,
+                view: Some(view),
+            });
+            return self.memory_words(view, byte, n);
+        };
+        let look = self.looks[earlier];
+        let head = self.cur;
+        let same = self.s.m.cmp(head, pred::EQ, page, look.page);
+        let near = self.s.m.bin(head, Bin::And, same, look.there);
+        let (short, far, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(head, Term::CondBr(near, short, far));
+        // The earlier look's page: its view, the same start.
+        self.cur = short;
+        let view = match look.view {
+            Some(view) => view,
+            None if look.base == base => {
+                let view = self.memory_handle(look.home, look.slot);
+                self.looks[earlier].view = Some(view);
+                view
+            }
+            None => self.memory_handle(short, look.slot),
+        };
+        let k64k = self.s.m.i32(0xFFFF);
+        let within = self.s.m.bin(short, Bin::And, lo, k64k);
+        let byte = self.s.m.bin(short, Bin::Add, look.start, within);
+        let near_words = self.memory_words(view, byte, n);
+        self.s.m.terminate(short, Term::Br(join));
+        // Another page: a look of its own.
+        self.cur = far;
+        let (slot, start, there) = self.memory_entry(page, guard, false);
+        let (view, byte) = self.memory_view(slot, start, lo);
+        let far_words = self.memory_words(view, byte, n);
+        let far_end = self.cur;
+        self.s.m.terminate(far_end, Term::Br(join));
+        self.cur = join;
+        let i32t = self.s.t.i32;
+        let words = near_words
+            .iter()
+            .zip(&far_words)
+            .map(|(&a, &b)| {
+                let phi = self.s.m.phi(join, i32t);
+                self.s.m.set_phi(phi, vec![(a, short), (b, far_end)]);
+                phi
+            })
+            .collect();
+        let (slot, start, there) =
+            self.memory_joined(join, (short, look.slot, look.start, look.there), (far_end, slot, start, there));
+        self.page_there = Some(there);
+        self.looks.push(Look {
+            ir: self.cur_ir,
+            base,
+            page,
+            slot,
+            start,
+            there,
+            home: join,
+            view: None,
+        });
+        words
+    }
+
+    /// The handle of the raw view of title memory at heap slot `slot`, made
+    /// in `block`.
+    fn memory_handle(&mut self, block: usize, slot: V) -> V {
+        let coherent = if crate::spill::is_spilled(self.x.native) { 0x4000 } else { 0 };
+        self.s.heap_handle(block, slot, false, true, (11 | 0x1000 | coherent, 0))
+    }
+
+    /// The earlier look (its place in `looks`) a read from `base` in the
+    /// block being lowered may take its page from ([`Lower::memory_near`]):
+    /// the first one from the same address registers (a record's dwords: its
+    /// view serves them all), else the latest.
+    fn look_before(&mut self, base: (V, V)) -> Option<usize> {
+        if self.looks.is_empty() {
+            return None;
+        }
+        if self.idom.is_none() {
+            let p = self.x.p;
+            let order = crate::ir::reverse_postorder(&p.blocks);
+            self.idom = Some(crate::ir::idoms(&p.blocks, &order, &self.rpo));
+        }
+        let idom = self.idom.as_ref().expect("made above");
+        // This block and those that dominate it, up to the header of the
+        // innermost loop around it: a look from before the loop is of
+        // another node.
+        let mut above = vec![self.cur_ir];
+        let mut d = self.cur_ir;
+        while !self.counters.contains_key(&d) && idom[d] != d && idom[d] != usize::MAX {
+            d = idom[d];
+            above.push(d);
+        }
+        let known = |l: &Look| above.contains(&l.ir);
+        self.looks
+            .iter()
+            .position(|l| known(l) && l.base == base)
+            .or_else(|| self.looks.iter().rposition(known))
     }
 
     /// The title address in the root view `src` is built around, in a program
@@ -3670,8 +3969,8 @@ impl<'a> Lower<'a> {
             let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
             l.i32_of(v)
         };
-        let (lo, hi) = (word(self, 0)?, word(self, 1)?);
-        let (lo, hi) = self.address_plus(lo, hi, i32::from(*offset));
+        let base = (word(self, 0)?, word(self, 1)?);
+        let (lo, hi) = self.address_plus(base.0, base.1, i32::from(*offset));
         let guard = self.guard(b, i)?;
         let (i32t, res, void) = (self.s.t.i32, self.s.t.res_ret, self.s.t.void);
         let iu = self.s.m.undef(i32t);
@@ -3689,6 +3988,13 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *dst else {
                 return Err("a global load result");
             };
+            if self.memory_shares() {
+                let words = self.memory_near_words(lo, hi, base, guard, n);
+                for (k, x) in words.into_iter().enumerate() {
+                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                }
+                return Ok(());
+            }
             let (h, byte) = self.memory(lo, hi, guard, false);
             let c = self.cur;
             let mask = self.s.m.i8((1u8 << n) - 1);
@@ -11547,6 +11853,55 @@ impl<'a> Lower<'a> {
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
+        let sampler = self.descriptors.get(&((b, i), true)).copied();
+        // A sampler picked from two immediate ones by a uniform branch (after
+        // DexNom/VIctory ddb7332: 40 shader variants of the title translate).
+        // `VICTORY_SAMPLER_CHOICE=0`: such a program is refused, as before.
+        if sampler_choice_on()
+            && let Some(Source::Phi { block, args }) = sampler
+            && let [first @ Source::Constant(_), second @ Source::Constant(_)] = args.as_slice()
+            && let [left, right] = self.x.p.blocks[*block].preds.as_slice()
+        {
+            // Immediate samplers are separate static bindings. Sample both with
+            // the original derivatives, then select the texel on the same edge
+            // that supplied the console's sampler.
+            if self.block[*left].is_none() {
+                return self.image_with_sampler(inst, b, i, Some(second));
+            }
+            if self.block[*right].is_none() {
+                return self.image_with_sampler(inst, b, i, Some(first));
+            }
+            let edge = |pred: usize| {
+                self.edges.get(&(pred, *block)).copied().or(self.tail[pred])
+                    .ok_or("a sampler choice with an unfinished predecessor")
+            };
+            let (left, right) = (edge(*left)?, edge(*right)?);
+            let join = self.block[*block].ok_or("a sampler choice without a host block")?;
+            let chosen = self.s.m.phi(join, self.s.t.i1);
+            let (yes, no) = (self.s.m.bool(true), self.s.m.bool(false));
+            self.s.m.set_phi(chosen, vec![(yes, left), (no, right)]);
+            self.image_with_sampler(inst, b, i, Some(first))?;
+            let left = inst.writes.iter()
+                .map(|&(_, v)| self.i32_of(v))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.image_with_sampler(inst, b, i, Some(second))?;
+            for (&(_, v), a) in inst.writes.iter().zip(left) {
+                let b = self.i32_of(v)?;
+                let result = self.s.m.select(self.cur, chosen, a, b);
+                self.vals.insert(v, Val::I32(result));
+            }
+            return Ok(());
+        }
+        self.image_with_sampler(inst, b, i, sampler)
+    }
+
+    fn image_with_sampler(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        sampler: Option<&Source>,
+    ) -> Result<(), Why> {
         let Fields::Image {
             data,
             addr,
@@ -11875,11 +12230,7 @@ impl<'a> Lower<'a> {
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
-            let ss = self
-                .descriptors
-                .get(&(site, true))
-                .copied()
-                .ok_or("an untracked sampler")?;
+            let ss = sampler.ok_or("an untracked sampler")?;
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
             let cmp = matches!(op, 64 | 65);
@@ -14114,6 +14465,30 @@ mod tests {
                 range(ResourceType::Sampler, 1, 1),
             ],
         )
+    }
+
+    #[test]
+    fn a_uniform_branch_can_choose_between_immediate_samplers() {
+        // A root constant selects wrap or clamp. Keep the sample live with an LDS store.
+        let words = [
+            0xBE84_0300, 0xBE85_0380,       // s[4:5] = texture table
+            0xF40C_0302, 0xFA00_0000,       // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xBE89_0380, 0xBE8A_0380, 0xBE8B_0380, // sampler words 1-3
+            0xBF06_8001,                    // s_cmp_eq_u32 s1, 0
+            0xBF85_0002,                    // branch to clamp
+            0xBE88_0380, 0xBF82_0002,       // wrap, skip clamp
+            0xBE88_03FF, 0x0000_0092,       // clamp all axes
+            0xF09C_0F08, 0x0043_0C02,       // image_sample_lz v[12:15], ..., s[8:11]
+            0xD834_0000, 0x0000_0C00,       // ds_write_b32 v0, v12
+            S_ENDPGM,
+        ];
+        let (mut layout, mut used) = texture_tables();
+        layout[1] = root(RootType::Constants, 1, 1);
+        used.truncate(1);
+        let shader = lower_with(&words, layout, used).unwrap();
+        assert_eq!(shader.samplers.len(), 2);
+        assert!(shader.samplers.contains(&[0, 0, 0, 0]));
+        assert!(shader.samplers.contains(&[0x92, 0, 0, 0]));
     }
 
     #[test]
