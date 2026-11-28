@@ -2640,9 +2640,30 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// for the global lock; staging an unrelated texture during a one-second
 /// remap took 77 us with the ranges (DexNom/VIctory 5f4c3df, ported with
 /// credit, GPL-3.0, for this runtime's own views and mapping threads).
+///
+/// Off with lazy or soft views (`VICTORY_LAZY_VIEWS=1`, `VICTORY_SOFT_VIEWS`):
+/// there a read in place may fault into a view kept in the books and need
+/// the runtime's record of views to make it real (xmem.rs `materialize`).
+/// With the ranges a change of other memory runs beside the read, holding
+/// that record, and on its way takes locks such a read may hold (a texture
+/// copy-back holds its tickets while it writes, `crate::texback::land`;
+/// the change takes them in `title_memory_unmapping`): each would wait for
+/// the other. With the whole of memory no change runs beside a read.
 pub fn mapping_ranges() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPING_RANGES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_MAPPING_RANGES").is_none_or(|v| v != "0");
+        let lazy = std::env::var_os("VICTORY_LAZY_VIEWS").is_some_and(|v| v == "1");
+        let soft = std::env::var("VICTORY_SOFT_VIEWS").is_ok_and(|v| matches!(v.trim(), "1" | "pool" | "copies"));
+        let on = asked && !lazy && !soft;
+        tracing::info!(
+            on,
+            asked,
+            lazy_or_soft_views = lazy || soft,
+            "changes of mapping wait only for reads of what they take away (VICTORY_MAPPING_RANGES)"
+        );
+        on
+    })
 }
 
 /// All of title memory, for a read or a change that does not say where.
