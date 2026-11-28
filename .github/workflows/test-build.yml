@@ -3,14 +3,18 @@
 # release without installing Rust. Lint and tests are skipped on purpose;
 # CI (ci.yml) is where those run.
 #
-# Two ways to start it:
-#   - push a tag named test-build-* on a commit that has this file;
-#   - Actions > Test build > Run workflow (only once this file is on the
-#     default branch), naming the branch to build.
+# Ways to start it (the commit built must contain this file):
+#   - push to a branch named test-build/<anything>;
+#   - push a tag named test-build-*;
+#   - Actions > Test build > Run workflow, naming the branch to build
+#     (GitHub offers the button once this file is on the default branch).
+# ci/fork-test-build-* is the branch that added this workflow; pushes to it
+# build too, which produced the first test build.
 name: Test build
 
 on:
   push:
+    branches: ["test-build/**", "ci/fork-test-build-*"]
     tags: ["test-build-*"]
   workflow_dispatch:
     inputs:
