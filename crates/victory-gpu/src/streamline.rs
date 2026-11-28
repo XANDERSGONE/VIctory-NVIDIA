@@ -643,74 +643,16 @@ pub fn dlss_framegen_card(name: &str) -> bool {
     model.len() == 4 && (model.starts_with("40") || model.starts_with("50"))
 }
 
-/// The adapter the title's device is on ([`title_adapter`]), its name and LUID.
+/// The adapter a device made with no adapter named is on (the first), its
+/// name and LUID.
 fn default_adapter() -> Option<(String, windows::Win32::Foundation::LUID)> {
     // SAFETY: plain DXGI queries.
     unsafe {
-        let adapter = title_adapter()?;
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let adapter = factory.EnumAdapters1(0).ok()?;
         let desc = adapter.GetDesc1().ok()?;
         let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
         Some((String::from_utf16_lossy(&desc.Description[..len]), desc.AdapterLuid))
-    }
-}
-
-/// The card the title's device is made on: the one `VICTORY_ADAPTER` names, else
-/// Windows' default (the first, the one the main display is on). The host's device,
-/// Streamline's support checks, the start notice and the shader model check all use
-/// it, so that they speak of the same card.
-pub(crate) fn title_adapter() -> Option<IDXGIAdapter1> {
-    // SAFETY: plain DXGI queries.
-    unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
-        chosen_adapter(&factory).or_else(|| factory.EnumAdapters1(0).ok())
-    }
-}
-
-/// The card `VICTORY_ADAPTER` names, for a PC with more than one: part of the
-/// card's name, any case (`5070`, `RTX 5060 Ti`), or its index in DXGI's order
-/// (`#1`). Unset: none. A value that matches no hardware card is logged with
-/// the list of cards and ignored (Windows' default card is used).
-fn chosen_adapter(factory: &IDXGIFactory1) -> Option<IDXGIAdapter1> {
-    static LOGGED: AtomicBool = AtomicBool::new(false);
-    let want = std::env::var("VICTORY_ADAPTER").ok()?;
-    let want = want.trim();
-    if want.is_empty() {
-        return None;
-    }
-    let first = !LOGGED.swap(true, Relaxed);
-    let mut seen = Vec::new();
-    for i in 0.. {
-        // SAFETY: plain DXGI queries.
-        let Ok(adapter) = (unsafe { factory.EnumAdapters1(i) }) else { break };
-        // SAFETY: as above.
-        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else { continue };
-        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
-        let name = String::from_utf16_lossy(&desc.Description[..len]);
-        let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
-        if !software && adapter_named(want, i, &name) {
-            if first {
-                tracing::warn!(
-                    adapter = %name,
-                    index = i,
-                    memory_mb = desc.DedicatedVideoMemory / (1024 * 1024),
-                    "the title runs on the card VICTORY_ADAPTER names"
-                );
-            }
-            return Some(adapter);
-        }
-        seen.push(format!("#{i} {name}"));
-    }
-    if first {
-        tracing::warn!(want, cards = %seen.join(", "), "VICTORY_ADAPTER names no hardware card; Windows' default card is used");
-    }
-    None
-}
-
-/// Whether `want` (a `VICTORY_ADAPTER` value) names the card `name` at `index`.
-fn adapter_named(want: &str, index: u32, name: &str) -> bool {
-    match want.strip_prefix('#') {
-        Some(n) => n.trim().parse::<u32>().is_ok_and(|n| n == index),
-        None => name.to_lowercase().contains(&want.to_lowercase()),
     }
 }
 
@@ -742,7 +684,8 @@ pub fn highest_shader_model() -> Option<(u32, u32)> {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
     // SAFETY: plain DXGI and D3D12 calls with owned results.
     let device = unsafe {
-        let adapter = title_adapter()?;
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let adapter = factory.EnumAdapters1(0).ok()?;
         let mut device: Option<ID3D12Device> = None;
         D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
         device?
@@ -2331,22 +2274,5 @@ pub(crate) fn line(frames: f64) {
                 "DLSS Frame Generation, colour without the interface, last ten lines: {copies} copies in front of the title's interface composite, {tagged} presents tagged with one, {missing} presents with frame generation on had none; {composites} interface composite draws into a presented texture ({again} after a copy in their list), {others} draws of other pipelines into one"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod adapter_tests {
-    use super::adapter_named;
-
-    #[test]
-    fn victory_adapter_names_a_card_by_part_of_its_name_or_index() {
-        let card = "NVIDIA GeForce RTX 5060 Ti";
-        assert!(adapter_named("5060", 1, card));
-        assert!(adapter_named("rtx 5060 TI", 1, card));
-        assert!(!adapter_named("5070", 1, card));
-        assert!(adapter_named("#1", 1, card));
-        assert!(adapter_named("# 1", 1, card));
-        assert!(!adapter_named("#0", 1, card));
-        assert!(!adapter_named("#x", 1, card));
     }
 }

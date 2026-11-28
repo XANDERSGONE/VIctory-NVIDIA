@@ -911,11 +911,7 @@ fn create() -> windows::core::Result<Host> {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
         } else {
-            // The card VICTORY_ADAPTER names, else Windows' default.
-            match crate::streamline::title_adapter() {
-                Some(adapter) => D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-                None => D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?,
-            }
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             // Whether a GPU hang ends the run or freezes the PC (#1054).
             crate::tdr::log();
         }
