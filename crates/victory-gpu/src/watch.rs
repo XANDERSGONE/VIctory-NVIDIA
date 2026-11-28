@@ -55,6 +55,16 @@ fn parts_on() -> bool {
 }
 
 impl Journal {
+    /// Whether pages `[first, last)` lie in one range asked ahead.
+    fn covers(&self, first: usize, last: usize) -> bool {
+        if self.ordered {
+            let i = self.ahead.partition_point(|&(_, end)| end < last);
+            self.ahead.get(i).is_some_and(|&(start, _)| start <= first)
+        } else {
+            self.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        }
+    }
+
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
@@ -129,6 +139,10 @@ struct Journal {
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
+    /// `ahead` holds the pieces a reservation asking was asked for
+    /// ([`ask_reservations`]), starts and ends both in order: a range is
+    /// looked up by halves, not by walking thousands of pieces.
+    ordered: bool,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -146,6 +160,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Vec::new(),
+    ordered: false,
     ahead_asked: 0,
     kept: false,
 });
@@ -363,6 +378,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
+    j.ordered = false;
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -545,6 +561,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
+    if by_reservation() {
+        ask_reservations(ranges);
+        return;
+    }
     ask_ahead(ranges);
     ask_rest(ranges);
 }
@@ -588,6 +608,168 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    j.ordered = false;
+}
+
+/// Whether a submission's one asking ([`ask_once`]) asks the kernel once
+/// per reservation its ranges lie in (`VICTORY_WATCH_RESERVATION=1`; off by
+/// default), not by [`ask_ahead`]'s runs and [`ask_rest`]'s single ranges.
+///
+/// A run of [`ask_ahead`] that crosses from one reservation into the next is
+/// refused by the kernel, then asked again by halves, and what is left alone
+/// is asked once more by [`ask_rest`]: Kelvaroq's profile found 51 of 245
+/// busy samples of the submitting thread in GetWriteWatch, seven of them
+/// below such splits. Asked where each reservation ends, a run stops there
+/// and is asked once. Kelvaroq's patch 0045 (stellarr-studio/kelvaroq,
+/// GPL-3.0-or-later, as this is) measured the median heavy frame at 129 ms
+/// before and 110 ms after on an RTX 5080; this is a re-implementation of it
+/// on this journal.
+fn by_reservation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WATCH_RESERVATION").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("a submission's one asking of the write watch is made once per reservation (VICTORY_WATCH_RESERVATION=1)");
+        }
+        on
+    })
+}
+
+/// [`ask_once`] by reservation ([`by_reservation`]): one asking for each
+/// group of nearby ranges that lies in one reservation, under one number.
+/// Only the ranges asked for are kept as answered: a range in a gap between
+/// them was asked about too, and its pages noted, but a later look at it
+/// asks again and sees what was written since.
+fn ask_reservations(ranges: &[(usize, usize)]) {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        // Not view memory known by its bits, as in `ask_ahead`.
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    pieces.sort_unstable();
+    let _all = Asking::hold_all();
+    let (mut ahead, mut written) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    for group in reservation_groups(&pieces, reservation) {
+        let asked = &pieces[at..at + group.pieces];
+        at += group.pieces;
+        // A view, or memory mapped from a file, is not write-watched: the
+        // kernel would refuse, and its ranges are left to `writes`.
+        if group.private
+            && let Some(pages) = kernel_written(group.first, group.last)
+        {
+            written.extend(pages);
+            keep_requested(&mut ahead, asked);
+        }
+    }
+    note_hot(&written);
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in written {
+        j.note(page, parts, now);
+    }
+    j.kept = !ahead.is_empty();
+    j.ahead = ahead;
+    j.ordered = true;
+}
+
+/// One kernel asking of [`ask_reservations`]: pages `[first, last)`, for the
+/// next `pieces` pieces, in a reservation that is `private` (or not known).
+#[derive(Debug, PartialEq, Eq)]
+struct Group {
+    first: usize,
+    last: usize,
+    pieces: usize,
+    private: bool,
+}
+
+/// The askings for `pieces` (page ranges, sorted): nearby pieces of one
+/// reservation together. `reservation` says of a page where its reservation
+/// ends (a page number) and whether it is private memory; it is asked only
+/// where a piece could be joined with the next, so a piece alone costs one
+/// kernel call and no more.
+fn reservation_groups(pieces: &[(usize, usize)], mut reservation: impl FnMut(usize) -> Option<(usize, bool)>) -> Vec<Group> {
+    let mut groups = Vec::new();
+    let mut known: Option<(usize, bool)> = None;
+    let mut i = 0;
+    while let Some(&(first, end)) = pieces.get(i) {
+        if known.is_none_or(|(limit, _)| first >= limit) {
+            let next = pieces.get(i + 1).is_some_and(|&next| can_join(first, end, next));
+            known = if next { reservation(first) } else { None };
+        }
+        // Not asked (or not answered): this piece alone, and what lies in it.
+        let (limit, private) = known.unwrap_or((end, true));
+        let mut last = end;
+        let mut n = 1;
+        while let Some(&next) = pieces.get(i + n) {
+            if last > limit || next.1 > limit || !can_join(first, last, next) {
+                break;
+            }
+            last = last.max(next.1);
+            n += 1;
+        }
+        groups.push(Group { first, last, pieces: n, private });
+        i += n;
+    }
+    groups
+}
+
+/// Whether the piece `(start, end)` is asked together with the run of pages
+/// `[first, last)` before it: the gap between them is at most [`AHEAD_GAP`],
+/// or no wider than the smaller of the two (walking it costs less than
+/// another call), and the asking stays within [`AHEAD_MAX`]. Two small
+/// ranges far apart in one large reservation are asked apart.
+fn can_join(first: usize, last: usize, (start, end): (usize, usize)) -> bool {
+    last.max(end) - first <= AHEAD_MAX && start.saturating_sub(last) <= AHEAD_GAP.max((last - first).min(end - start))
+}
+
+/// Where the reservation that holds page `first` ends (a page number, of the
+/// whole pages in it) and whether it is private memory, as Windows says;
+/// `None` if it cannot say.
+fn reservation(first: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: the query reads nothing at the address and fills `info`.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            (first * PAGE) as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = (info.AllocationBase as usize).checked_add(info.RegionSize)? / PAGE;
+    // SAFETY: a successful query filled the flags; bit 0 is Private.
+    Some((end, unsafe { info.Anonymous.Flags } & 1 != 0))
+}
+
+/// Adds the pieces one asking answered (sorted) to `ahead`, keeping starts
+/// and ends in order ([`Journal::covers`]): a piece inside the last one kept
+/// is not added again, and pieces that touch or overlap are one entry only
+/// when this asking answered both.
+fn keep_requested(ahead: &mut Vec<(usize, usize)>, pieces: &[(usize, usize)]) {
+    let mut this_asking = false;
+    for &(start, end) in pieces {
+        if let Some((_, last)) = ahead.last_mut() {
+            if end <= *last {
+                continue;
+            }
+            if this_asking && start <= *last {
+                *last = end;
+                continue;
+            }
+        }
+        ahead.push((start, end));
+        this_asking = true;
+    }
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -660,9 +842,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    j.covers(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -681,7 +861,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| j.covers(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -765,7 +945,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !j.covers(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -3239,6 +3419,126 @@ pub(crate) mod test_books {
     }
 }
 
+/// The reservation asking ([`ask_reservations`]); after Kelvaroq's tests for
+/// its patch 0045 (stellarr-studio/kelvaroq).
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    fn journal_of(ahead: Vec<(usize, usize)>) -> Journal {
+        Journal {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead,
+            ordered: true,
+            ahead_asked: 1,
+            kept: true,
+        }
+    }
+
+    #[test]
+    fn the_pieces_asked_for_are_kept_in_order_and_the_holes_are_not() {
+        let mut ahead = Vec::new();
+        keep_requested(&mut ahead, &[(1, 3), (3, 6), (7, 10)]);
+        keep_requested(&mut ahead, &[(8, 9), (9, 11)]);
+        keep_requested(&mut ahead, &[(11, 12)]);
+        let j = journal_of(ahead);
+        for (first, last) in [(1, 6), (2, 5), (7, 10), (9, 11), (11, 12)] {
+            assert!(j.covers(first, last), "{first}..{last}");
+        }
+        // A hole, and ranges across a hole or across two askings.
+        for (first, last) in [(5, 8), (6, 7), (10, 12), (0, 2), (12, 13)] {
+            assert!(!j.covers(first, last), "{first}..{last}");
+        }
+    }
+
+    #[test]
+    fn nearby_pieces_of_one_reservation_are_one_asking() {
+        let groups = reservation_groups(&[(0, 10), (15, 20), (20, 30)], |_| Some((100, true)));
+        assert_eq!(groups, [Group { first: 0, last: 30, pieces: 3, private: true }]);
+    }
+
+    #[test]
+    fn the_end_of_a_reservation_ends_the_asking() {
+        let groups = reservation_groups(&[(0, 10), (12, 20)], |page| Some(if page < 11 { (11, true) } else { (50, true) }));
+        assert_eq!(
+            groups,
+            [Group { first: 0, last: 10, pieces: 1, private: true }, Group { first: 12, last: 20, pieces: 1, private: true }]
+        );
+    }
+
+    #[test]
+    fn a_piece_alone_costs_no_question_to_windows() {
+        let far = 4 * AHEAD_GAP;
+        let mut asked = 0;
+        let groups = reservation_groups(&[(0, 1), (far, far + 1)], |_| {
+            asked += 1;
+            Some((usize::MAX, true))
+        });
+        assert_eq!(asked, 0);
+        assert_eq!(
+            groups,
+            [Group { first: 0, last: 1, pieces: 1, private: true }, Group { first: far, last: far + 1, pieces: 1, private: true }]
+        );
+    }
+
+    #[test]
+    fn a_large_gap_is_walked_only_between_large_pieces() {
+        let width = AHEAD_GAP + 1;
+        // Two pieces as wide as the gap between them: one asking.
+        let wide = reservation_groups(&[(0, width), (2 * width, 3 * width)], |_| Some((3 * width, true)));
+        assert_eq!(wide, [Group { first: 0, last: 3 * width, pieces: 2, private: true }]);
+        // A small piece across the same gap: two.
+        let small = reservation_groups(&[(0, 1), (2 * width, 3 * width)], |_| Some((3 * width, true)));
+        assert_eq!(small.len(), 2);
+    }
+
+    #[test]
+    fn a_piece_across_the_end_cannot_hide_a_piece_inside() {
+        let groups = reservation_groups(&[(0, 3), (1, 2)], |_| Some((2, true)));
+        assert_eq!(
+            groups,
+            [Group { first: 0, last: 3, pieces: 1, private: true }, Group { first: 1, last: 2, pieces: 1, private: true }]
+        );
+    }
+
+    #[test]
+    fn view_memory_is_not_asked() {
+        let groups = reservation_groups(&[(0, 1), (2, 3)], |_| Some((10, false)));
+        assert_eq!(groups, [Group { first: 0, last: 3, pieces: 2, private: false }]);
+    }
+
+    /// Windows says where a real write-watched reservation ends, and the one
+    /// asking for two pieces far apart in it answers both, notes a write in
+    /// the hole, and keeps only the two pieces as answered.
+    #[test]
+    fn one_reservation_is_one_asking_and_its_hole_is_noted() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let width = (AHEAD_GAP + 1) * PAGE;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 3 * width, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let (first, gap) = (p / PAGE, (p + width) / PAGE);
+        assert_eq!(reservation(first), Some((first + 3 * width / PAGE, true)));
+        let ranges = [(p + 2 * width, p + 3 * width), (p, p + width)];
+        let mut pieces: Vec<_> = ranges.iter().map(|&(s, e)| (s / PAGE, e.div_ceil(PAGE))).collect();
+        pieces.sort_unstable();
+        assert_eq!(reservation_groups(&pieces, reservation).len(), 1);
+        // SAFETY: committed pages of ours, in the hole between the pieces.
+        unsafe { ((p + width + 8) as *mut u8).write_volatile(1) };
+        ask_reservations(&ranges);
+        let noted = journal().written.get(&gap).copied();
+        assert!(noted.is_some(), "the write in the hole was noted");
+        assert!(asked(p, p + width).is_some());
+        assert!(asked(p + 2 * width, p + 3 * width).is_some());
+        assert!(asked(p + width, p + 2 * width).is_none(), "the hole is asked again");
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
 #[cfg(test)]
 mod parts_tests {
     use super::*;
@@ -3249,6 +3549,7 @@ mod parts_tests {
             written: BTreeMap::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Vec::new(),
+            ordered: false,
             ahead_asked: 0,
             kept: false,
         };
