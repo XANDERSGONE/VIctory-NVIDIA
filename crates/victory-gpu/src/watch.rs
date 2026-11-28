@@ -55,6 +55,16 @@ fn parts_on() -> bool {
 }
 
 impl Journal {
+    /// Whether pages `[first, last)` lie in one range asked ahead.
+    fn covers(&self, first: usize, last: usize) -> bool {
+        if self.ordered {
+            let i = self.ahead.partition_point(|&(_, end)| end < last);
+            self.ahead.get(i).is_some_and(|&(start, _)| start <= first)
+        } else {
+            self.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        }
+    }
+
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
@@ -129,6 +139,10 @@ struct Journal {
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
+    /// `ahead` holds the pieces a reservation asking was asked for
+    /// ([`ask_reservations`]), starts and ends both in order: a range is
+    /// looked up by halves, not by walking thousands of pieces.
+    ordered: bool,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
@@ -146,6 +160,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Vec::new(),
+    ordered: false,
     ahead_asked: 0,
     kept: false,
 });
@@ -363,6 +378,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
     j.ahead = asked;
+    j.ordered = false;
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -545,6 +561,10 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         return;
     }
     ask_once_end();
+    if by_reservation() {
+        ask_reservations(ranges);
+        return;
+    }
     ask_ahead(ranges);
     ask_rest(ranges);
 }
@@ -588,6 +608,168 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    j.ordered = false;
+}
+
+/// Whether a submission's one asking ([`ask_once`]) asks the kernel once
+/// per reservation its ranges lie in (`VICTORY_WATCH_RESERVATION=1`; off by
+/// default), not by [`ask_ahead`]'s runs and [`ask_rest`]'s single ranges.
+///
+/// A run of [`ask_ahead`] that crosses from one reservation into the next is
+/// refused by the kernel, then asked again by halves, and what is left alone
+/// is asked once more by [`ask_rest`]: Kelvaroq's profile found 51 of 245
+/// busy samples of the submitting thread in GetWriteWatch, seven of them
+/// below such splits. Asked where each reservation ends, a run stops there
+/// and is asked once. Kelvaroq's patch 0045 (stellarr-studio/kelvaroq,
+/// GPL-3.0-or-later, as this is) measured the median heavy frame at 129 ms
+/// before and 110 ms after on an RTX 5080; this is a re-implementation of it
+/// on this journal.
+fn by_reservation() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WATCH_RESERVATION").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("a submission's one asking of the write watch is made once per reservation (VICTORY_WATCH_RESERVATION=1)");
+        }
+        on
+    })
+}
+
+/// [`ask_once`] by reservation ([`by_reservation`]): one asking for each
+/// group of nearby ranges that lies in one reservation, under one number.
+/// Only the ranges asked for are kept as answered: a range in a gap between
+/// them was asked about too, and its pages noted, but a later look at it
+/// asks again and sees what was written since.
+fn ask_reservations(ranges: &[(usize, usize)]) {
+    let mut pieces: Vec<(usize, usize)> = ranges
+        .iter()
+        // Not view memory known by its bits, as in `ask_ahead`.
+        .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+        .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+        .collect();
+    pieces.sort_unstable();
+    let _all = Asking::hold_all();
+    let (mut ahead, mut written) = (Vec::new(), Vec::new());
+    let mut at = 0;
+    for group in reservation_groups(&pieces, reservation) {
+        let asked = &pieces[at..at + group.pieces];
+        at += group.pieces;
+        // A view, or memory mapped from a file, is not write-watched: the
+        // kernel would refuse, and its ranges are left to `writes`.
+        if group.private
+            && let Some(pages) = kernel_written(group.first, group.last)
+        {
+            written.extend(pages);
+            keep_requested(&mut ahead, asked);
+        }
+    }
+    note_hot(&written);
+    let mut j = journal_mut();
+    let now = next_asking();
+    j.ahead_asked = now;
+    for (page, parts) in written {
+        j.note(page, parts, now);
+    }
+    j.kept = !ahead.is_empty();
+    j.ahead = ahead;
+    j.ordered = true;
+}
+
+/// One kernel asking of [`ask_reservations`]: pages `[first, last)`, for the
+/// next `pieces` pieces, in a reservation that is `private` (or not known).
+#[derive(Debug, PartialEq, Eq)]
+struct Group {
+    first: usize,
+    last: usize,
+    pieces: usize,
+    private: bool,
+}
+
+/// The askings for `pieces` (page ranges, sorted): nearby pieces of one
+/// reservation together. `reservation` says of a page where its reservation
+/// ends (a page number) and whether it is private memory; it is asked only
+/// where a piece could be joined with the next, so a piece alone costs one
+/// kernel call and no more.
+fn reservation_groups(pieces: &[(usize, usize)], mut reservation: impl FnMut(usize) -> Option<(usize, bool)>) -> Vec<Group> {
+    let mut groups = Vec::new();
+    let mut known: Option<(usize, bool)> = None;
+    let mut i = 0;
+    while let Some(&(first, end)) = pieces.get(i) {
+        if known.is_none_or(|(limit, _)| first >= limit) {
+            let next = pieces.get(i + 1).is_some_and(|&next| can_join(first, end, next));
+            known = if next { reservation(first) } else { None };
+        }
+        // Not asked (or not answered): this piece alone, and what lies in it.
+        let (limit, private) = known.unwrap_or((end, true));
+        let mut last = end;
+        let mut n = 1;
+        while let Some(&next) = pieces.get(i + n) {
+            if last > limit || next.1 > limit || !can_join(first, last, next) {
+                break;
+            }
+            last = last.max(next.1);
+            n += 1;
+        }
+        groups.push(Group { first, last, pieces: n, private });
+        i += n;
+    }
+    groups
+}
+
+/// Whether the piece `(start, end)` is asked together with the run of pages
+/// `[first, last)` before it: the gap between them is at most [`AHEAD_GAP`],
+/// or no wider than the smaller of the two (walking it costs less than
+/// another call), and the asking stays within [`AHEAD_MAX`]. Two small
+/// ranges far apart in one large reservation are asked apart.
+fn can_join(first: usize, last: usize, (start, end): (usize, usize)) -> bool {
+    last.max(end) - first <= AHEAD_MAX && start.saturating_sub(last) <= AHEAD_GAP.max((last - first).min(end - start))
+}
+
+/// Where the reservation that holds page `first` ends (a page number, of the
+/// whole pages in it) and whether it is private memory, as Windows says;
+/// `None` if it cannot say.
+fn reservation(first: usize) -> Option<(usize, bool)> {
+    use windows_sys::Win32::System::Memory::{MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut info = WIN32_MEMORY_REGION_INFORMATION::default();
+    // SAFETY: the query reads nothing at the address and fills `info`.
+    let ok = unsafe {
+        QueryVirtualMemoryInformation(
+            GetCurrentProcess(),
+            (first * PAGE) as *const _,
+            MemoryRegionInfo,
+            (&raw mut info).cast(),
+            size_of_val(&info),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let end = (info.AllocationBase as usize).checked_add(info.RegionSize)? / PAGE;
+    // SAFETY: a successful query filled the flags; bit 0 is Private.
+    Some((end, unsafe { info.Anonymous.Flags } & 1 != 0))
+}
+
+/// Adds the pieces one asking answered (sorted) to `ahead`, keeping starts
+/// and ends in order ([`Journal::covers`]): a piece inside the last one kept
+/// is not added again, and pieces that touch or overlap are one entry only
+/// when this asking answered both.
+fn keep_requested(ahead: &mut Vec<(usize, usize)>, pieces: &[(usize, usize)]) {
+    let mut this_asking = false;
+    for &(start, end) in pieces {
+        if let Some((_, last)) = ahead.last_mut() {
+            if end <= *last {
+                continue;
+            }
+            if this_asking && start <= *last {
+                *last = end;
+                continue;
+            }
+        }
+        ahead.push((start, end));
+        this_asking = true;
+    }
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -660,9 +842,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
+    j.covers(first, last)
         .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
@@ -681,7 +861,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| j.covers(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -765,7 +945,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !j.covers(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -2618,11 +2798,92 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
+///
+/// With [`mapping_ranges`] (the default) a change says which addresses it
+/// may take away for its moment ([`title_memory_remapping_where`]), a read
+/// which it reads ([`title_memory_reading_range`]), and only the two that
+/// overlap wait for each other; the whole of title memory where either
+/// does not say ([`title_memory_remapping`], [`title_memory_reading`]).
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Whether changes of mapping and reads in place wait only for those of
+/// the other that overlap them (`VICTORY_MAPPING_RANGES=0`: every change
+/// waits for every read and every read for every change, [`MAPPING`] as
+/// before).
+///
+/// While the world streams in, the title changes a mapping most of the
+/// time, and every texture refresh that read in place waited for it, or
+/// (`VICTORY_TEXTURE_NO_WAIT=1`) read through the kernel instead, at twice
+/// the cost a megabyte and only what was mapped at that moment, the rest
+/// looked at again frames later. Most of those changes are of other
+/// textures' pages. DexNom measured a texture staging that waited 846 ms
+/// for the global lock; staging an unrelated texture during a one-second
+/// remap took 77 us with the ranges (DexNom/VIctory 5f4c3df, ported with
+/// credit, GPL-3.0, for this runtime's own views and mapping threads).
+///
+/// Which reads say their range: texture refreshes and plane fills
+/// ([`crate::texture`]), which read no view kept in the books in place.
+/// A texture copy-back ([`crate::texback::land`]) and a rectangle list's
+/// vertices read in place (`crate::draw`) take all of title memory: each may
+/// fault into such a view, or make it real (`crate::host::copy_mapped`),
+/// and need the runtime's record of views, which a change of other memory
+/// running beside it holds while it takes locks the copy-back holds (its
+/// tickets, in [`title_memory_unmapping`]).
+pub fn mapping_ranges() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_MAPPING_RANGES").is_none_or(|v| v != "0");
+        tracing::info!(on, "changes of mapping wait only for reads of what they take away (VICTORY_MAPPING_RANGES)");
+        on
+    })
+}
+
+/// All of title memory, for a read or a change that does not say where.
+const ALL_MEMORY: std::ops::Range<usize> = 0..usize::MAX;
+
+/// The changes and reads of [`mapping_ranges`]: the addresses the change
+/// under way (or waiting for reads to end) may take away, and those each
+/// read in place reads.
+struct Ranges {
+    changing: Vec<std::ops::Range<usize>>,
+    readers: Vec<std::ops::Range<usize>>,
+}
+
+impl Ranges {
+    /// Whether the change under way may take away part of `range`.
+    fn changing(&self, range: &std::ops::Range<usize>) -> bool {
+        self.changing.iter().any(|c| overlap(c, range))
+    }
+
+    /// Whether a read under way reads part of what the change may take away.
+    fn read(&self) -> bool {
+        self.readers.iter().any(|r| self.changing(r))
+    }
+}
+
+fn overlap(a: &std::ops::Range<usize>, b: &std::ops::Range<usize>) -> bool {
+    a.start.max(b.start) < a.end.min(b.end)
+}
+
+static RANGES: Mutex<Ranges> = Mutex::new(Ranges { changing: Vec::new(), readers: Vec::new() });
+/// Told whenever a read ends that a change waits for, and when a change ends.
+static RANGES_CHANGED: Condvar = Condvar::new();
+/// Held by the change under way ([`mapping_ranges`]): one at a time, as
+/// with [`MAPPING`].
+static CHANGER: Mutex<()> = Mutex::new(());
+
+fn ranges() -> std::sync::MutexGuard<'static, Ranges> {
+    RANGES.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(#[allow(dead_code)] Changer);
+
+enum Changer {
+    Whole(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>),
+    Ranges(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>),
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
@@ -2631,6 +2892,10 @@ impl Drop for Remapping {
             guards().changing.clear();
         }
         CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if matches!(self.0, Changer::Ranges(_)) {
+            ranges().changing.clear();
+            RANGES_CHANGED.notify_all();
+        }
     }
 }
 
@@ -2779,32 +3044,133 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
-    let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    let changing = if mapping_ranges() {
+        change_ranges(vec![ALL_MEMORY])
+    } else {
+        Changer::Whole(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    };
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
     Remapping(changing)
 }
 
+/// [`title_memory_remapping`] for a change that takes away for its moment
+/// no address outside what `extent` returns. `extent` is called once this
+/// thread is the only one that changes a mapping (no change can come
+/// between what it finds and the change), and before the reads that
+/// overlap it are waited for: it may take the runtime's record of views,
+/// which a read in place may need meanwhile (a lazy view it faults into),
+/// but must let go of it before it returns. Every address a host view
+/// shows that the change unmaps, even to map it again at once, is to be in
+/// what it returns. With `VICTORY_MAPPING_RANGES=0` it is not called.
+pub fn title_memory_remapping_where(extent: impl FnOnce() -> Vec<std::ops::Range<usize>>) -> Remapping {
+    if !mapping_ranges() {
+        return title_memory_remapping();
+    }
+    // As in `title_memory_remapping`.
+    install();
+    let changer = CHANGER.lock().unwrap_or_else(|e| e.into_inner());
+    let changing = announce(changer, extent());
+    CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CHANGING.set((true, false));
+    Remapping(changing)
+}
+
+/// The change of [`mapping_ranges`] over `changing`.
+fn change_ranges(changing: Vec<std::ops::Range<usize>>) -> Changer {
+    announce(CHANGER.lock().unwrap_or_else(|e| e.into_inner()), changing)
+}
+
+/// With the change's own lock held: says what the change may take away
+/// (no read of it begins from now on), and waits for the reads of it under
+/// way to end.
+fn announce(changer: std::sync::MutexGuard<'static, ()>, mut changing: Vec<std::ops::Range<usize>>) -> Changer {
+    changing.retain(|r| r.start < r.end);
+    changing.sort_unstable_by_key(|r| r.start);
+    let mut joined: Vec<std::ops::Range<usize>> = Vec::with_capacity(changing.len());
+    for r in changing {
+        match joined.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => joined.push(r),
+        }
+    }
+    let mut state = ranges();
+    state.changing = joined;
+    drop(RANGES_CHANGED.wait_while(state, |s| s.read()).unwrap_or_else(|e| e.into_inner()));
+    Changer::Ranges(changer)
+}
+
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading(#[allow(dead_code)] Reader);
+
+enum Reader {
+    Whole(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>),
+    Range(std::ops::Range<usize>),
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let Reader::Range(range) = &self.0 else {
+            return;
+        };
+        let mut state = ranges();
+        if let Some(i) = state.readers.iter().position(|r| r == range) {
+            state.readers.swap_remove(i);
+        }
+        if state.changing(range) {
+            RANGES_CHANGED.notify_all();
+        }
+    }
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_range(ALL_MEMORY)
+}
+
+/// [`title_memory_reading`] for a read of `range` alone: until what it
+/// returns is dropped, no change of mapping that may take away part of
+/// `range` is under way ([`mapping_ranges`]; all of title memory with
+/// `VICTORY_MAPPING_RANGES=0`). As there, not to be taken twice by one
+/// thread.
+pub fn title_memory_reading_range(range: std::ops::Range<usize>) -> Reading {
+    if !mapping_ranges() {
+        return Reading(Reader::Whole(MAPPING.read().unwrap_or_else(|e| e.into_inner())));
+    }
+    let mut state =
+        RANGES_CHANGED.wait_while(ranges(), |s| s.changing(&range)).unwrap_or_else(|e| e.into_inner());
+    state.readers.push(range.clone());
+    Reading(Reader::Range(range))
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
 /// runtime changes a mapping (or waits to), for a caller that has another
 /// way to read and would rather not wait.
 pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+    title_memory_reading_range_now(ALL_MEMORY)
+}
+
+/// [`title_memory_reading_range`] if it can be had at once: `None` while
+/// the runtime changes a mapping that may take away part of `range` (or
+/// waits to).
+pub fn title_memory_reading_range_now(range: std::ops::Range<usize>) -> Option<Reading> {
+    if !mapping_ranges() {
+        return match MAPPING.try_read() {
+            Ok(guard) => Some(Reading(Reader::Whole(guard))),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(Reader::Whole(e.into_inner()))),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
     }
+    // (The lock of the ranges is held for moments only: waited for.)
+    let mut state = ranges();
+    if state.changing(&range) {
+        return None;
+    }
+    state.readers.push(range.clone());
+    Some(Reading(Reader::Range(range)))
 }
 
 /// The runtime mapped title memory `[at, at + len)`: what it shows is new,
@@ -3239,6 +3605,126 @@ pub(crate) mod test_books {
     }
 }
 
+/// The reservation asking ([`ask_reservations`]); after Kelvaroq's tests for
+/// its patch 0045 (stellarr-studio/kelvaroq).
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    fn journal_of(ahead: Vec<(usize, usize)>) -> Journal {
+        Journal {
+            written: BTreeMap::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead,
+            ordered: true,
+            ahead_asked: 1,
+            kept: true,
+        }
+    }
+
+    #[test]
+    fn the_pieces_asked_for_are_kept_in_order_and_the_holes_are_not() {
+        let mut ahead = Vec::new();
+        keep_requested(&mut ahead, &[(1, 3), (3, 6), (7, 10)]);
+        keep_requested(&mut ahead, &[(8, 9), (9, 11)]);
+        keep_requested(&mut ahead, &[(11, 12)]);
+        let j = journal_of(ahead);
+        for (first, last) in [(1, 6), (2, 5), (7, 10), (9, 11), (11, 12)] {
+            assert!(j.covers(first, last), "{first}..{last}");
+        }
+        // A hole, and ranges across a hole or across two askings.
+        for (first, last) in [(5, 8), (6, 7), (10, 12), (0, 2), (12, 13)] {
+            assert!(!j.covers(first, last), "{first}..{last}");
+        }
+    }
+
+    #[test]
+    fn nearby_pieces_of_one_reservation_are_one_asking() {
+        let groups = reservation_groups(&[(0, 10), (15, 20), (20, 30)], |_| Some((100, true)));
+        assert_eq!(groups, [Group { first: 0, last: 30, pieces: 3, private: true }]);
+    }
+
+    #[test]
+    fn the_end_of_a_reservation_ends_the_asking() {
+        let groups = reservation_groups(&[(0, 10), (12, 20)], |page| Some(if page < 11 { (11, true) } else { (50, true) }));
+        assert_eq!(
+            groups,
+            [Group { first: 0, last: 10, pieces: 1, private: true }, Group { first: 12, last: 20, pieces: 1, private: true }]
+        );
+    }
+
+    #[test]
+    fn a_piece_alone_costs_no_question_to_windows() {
+        let far = 4 * AHEAD_GAP;
+        let mut asked = 0;
+        let groups = reservation_groups(&[(0, 1), (far, far + 1)], |_| {
+            asked += 1;
+            Some((usize::MAX, true))
+        });
+        assert_eq!(asked, 0);
+        assert_eq!(
+            groups,
+            [Group { first: 0, last: 1, pieces: 1, private: true }, Group { first: far, last: far + 1, pieces: 1, private: true }]
+        );
+    }
+
+    #[test]
+    fn a_large_gap_is_walked_only_between_large_pieces() {
+        let width = AHEAD_GAP + 1;
+        // Two pieces as wide as the gap between them: one asking.
+        let wide = reservation_groups(&[(0, width), (2 * width, 3 * width)], |_| Some((3 * width, true)));
+        assert_eq!(wide, [Group { first: 0, last: 3 * width, pieces: 2, private: true }]);
+        // A small piece across the same gap: two.
+        let small = reservation_groups(&[(0, 1), (2 * width, 3 * width)], |_| Some((3 * width, true)));
+        assert_eq!(small.len(), 2);
+    }
+
+    #[test]
+    fn a_piece_across_the_end_cannot_hide_a_piece_inside() {
+        let groups = reservation_groups(&[(0, 3), (1, 2)], |_| Some((2, true)));
+        assert_eq!(
+            groups,
+            [Group { first: 0, last: 3, pieces: 1, private: true }, Group { first: 1, last: 2, pieces: 1, private: true }]
+        );
+    }
+
+    #[test]
+    fn view_memory_is_not_asked() {
+        let groups = reservation_groups(&[(0, 1), (2, 3)], |_| Some((10, false)));
+        assert_eq!(groups, [Group { first: 0, last: 3, pieces: 2, private: false }]);
+    }
+
+    /// Windows says where a real write-watched reservation ends, and the one
+    /// asking for two pieces far apart in it answers both, notes a write in
+    /// the hole, and keeps only the two pieces as answered.
+    #[test]
+    fn one_reservation_is_one_asking_and_its_hole_is_noted() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let width = (AHEAD_GAP + 1) * PAGE;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 3 * width, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let (first, gap) = (p / PAGE, (p + width) / PAGE);
+        assert_eq!(reservation(first), Some((first + 3 * width / PAGE, true)));
+        let ranges = [(p + 2 * width, p + 3 * width), (p, p + width)];
+        let mut pieces: Vec<_> = ranges.iter().map(|&(s, e)| (s / PAGE, e.div_ceil(PAGE))).collect();
+        pieces.sort_unstable();
+        assert_eq!(reservation_groups(&pieces, reservation).len(), 1);
+        // SAFETY: committed pages of ours, in the hole between the pieces.
+        unsafe { ((p + width + 8) as *mut u8).write_volatile(1) };
+        ask_reservations(&ranges);
+        let noted = journal().written.get(&gap).copied();
+        assert!(noted.is_some(), "the write in the hole was noted");
+        assert!(asked(p, p + width).is_some());
+        assert!(asked(p + 2 * width, p + 3 * width).is_some());
+        assert!(asked(p + width, p + 2 * width).is_none(), "the hole is asked again");
+        ask_once_end();
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
 #[cfg(test)]
 mod parts_tests {
     use super::*;
@@ -3249,6 +3735,7 @@ mod parts_tests {
             written: BTreeMap::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Vec::new(),
+            ordered: false,
             ahead_asked: 0,
             kept: false,
         };
@@ -3486,6 +3973,7 @@ mod tests {
     /// the runtime has begun to change; after that it is again.
     #[test]
     fn what_is_left_alone_is_no_known_hole() {
+        let _serial = super::mapping_test_lock();
         let p = placeholder(3);
         let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
         let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
@@ -3526,6 +4014,7 @@ mod tests {
     /// begun to unmap: no note of it stays behind.
     #[test]
     fn nothing_is_guarded_between_our_forgetting_it_and_its_unmapping() {
+        let _serial = super::mapping_test_lock();
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of a block, mapped read-write.
         let view = unsafe {
@@ -4214,6 +4703,7 @@ mod tests {
     /// as written at each asking, at every view of it, until it has rested.
     #[test]
     fn a_block_just_written_rests() {
+        let _serial = super::mapping_test_lock();
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         let rests = |rests: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if rests { 3600 } else { 0 }));
@@ -4542,6 +5032,7 @@ mod tests {
     /// count as written wherever else they are shown.
     #[test]
     fn a_view_being_split_leaves_its_pages_unguarded_elsewhere() {
+        let _serial = super::mapping_test_lock();
         const SIZE: usize = 3 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages: Vec<usize> = (0..3).map(|k| one / PAGE + k).collect();
@@ -4742,9 +5233,24 @@ mod tests {
     }
 }
 
+/// Tests that hold title memory still, or change its mapping, on purpose
+/// take this first: they run in one process, and changes are one at a time,
+/// so one test's change of all of title memory, waiting for another test's
+/// read, kept that test's change of other memory waiting behind it.
+#[cfg(test)]
+pub(crate) static MAPPING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn mapping_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    MAPPING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{
+        mapping_ranges, title_memory_reading, title_memory_reading_range, title_memory_reading_range_now,
+        title_memory_remapping, title_memory_remapping_where,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
@@ -4753,6 +5259,7 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _serial = super::mapping_test_lock();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
@@ -4789,6 +5296,83 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// With [`mapping_ranges`], a change waits only for the reads of what it
+    /// may take away, and a read only for a change of what it reads; a read
+    /// of all of title memory, and a change that does not say where, wait
+    /// for every one of the other (DexNom/VIctory 5f4c3df).
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // (one range of a change)
+    fn reads_and_remappings_of_other_memory_do_not_wait_for_each_other() {
+        if !mapping_ranges() {
+            return; // VICTORY_MAPPING_RANGES=0: the test above
+        }
+        let _serial = super::mapping_test_lock();
+        let wait = Duration::from_millis(100);
+        // A change that should go ahead is given longer: other tests in the
+        // process read title memory for a moment now and then.
+        let ahead = Duration::from_secs(5);
+        // A read of one range: a change of another goes ahead, a change of
+        // part of it (or of all memory) waits for it.
+        for (changes, waits) in [
+            (vec![0x30000..0x40000], false),
+            (vec![0x60000..0x70000, 0x18000..0x28000], true),
+            (vec![0..usize::MAX], true),
+        ] {
+            let reading = title_memory_reading_range(0x10000..0x20000);
+            let (done, ended) = mpsc::channel();
+            let change = std::thread::spawn(move || {
+                let _changing = title_memory_remapping_where(|| changes);
+                done.send(()).unwrap();
+            });
+            assert_eq!(ended.recv_timeout(if waits { wait } else { ahead }).is_err(), waits);
+            drop(reading);
+            // (A change that went ahead has already said so above.)
+            if waits {
+                ended.recv().unwrap();
+            }
+            change.join().unwrap();
+        }
+        // A change of one range: a read of another begins, at once or not;
+        // a read of part of it does not, nor a read of all memory.
+        let (began, waiting) = mpsc::channel();
+        let (stop, stopped) = mpsc::channel::<()>();
+        let change = std::thread::spawn(move || {
+            let _changing = title_memory_remapping_where(|| vec![0x10000..0x20000]);
+            began.send(()).unwrap();
+            stopped.recv().unwrap();
+        });
+        waiting.recv().unwrap();
+        let deadline = std::time::Instant::now() + ahead;
+        while title_memory_reading_range_now(0x20000..0x30000).is_none() {
+            assert!(std::time::Instant::now() < deadline, "a read of other memory did not begin");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(title_memory_reading_range_now(0x1f000..0x21000).is_none());
+        drop(title_memory_reading_range(0x40000..0x50000));
+        let read = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = [0x18000..0x19000, 0..usize::MAX]
+            .into_iter()
+            .map(|range| {
+                let read = read.clone();
+                std::thread::spawn(move || {
+                    let _reading = title_memory_reading_range(range);
+                    read.store(true, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        std::thread::sleep(wait);
+        assert!(!read.load(Ordering::SeqCst), "a read began of what a change may take away");
+        stop.send(()).unwrap();
+        change.join().unwrap();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert!(read.load(Ordering::SeqCst));
+        // Nothing is left held: a change of all memory goes ahead.
+        drop(title_memory_remapping());
+        drop(title_memory_reading());
     }
 }
 
@@ -4870,6 +5454,7 @@ mod many_askers_tests {
     /// view and of three, resting and not.
     #[test]
     fn no_write_is_lost_when_faults_take_no_lock() {
+        let _serial = super::mapping_test_lock();
         const ALL: u32 = u32::MAX;
         const HALF: u32 = 0x5555_5555;
         writes_to_views_are_not_lost::<1>(0, ALL);

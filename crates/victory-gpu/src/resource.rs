@@ -1877,7 +1877,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         return filled < limit;
     }
     let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
+    if filled < floor && floor_admits(memory) {
         return true;
     }
     match memory {
@@ -1891,6 +1891,43 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         }
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// Whether the floor of [`room`] lets a texture in, past its line: always
+/// with `VICTORY_TEXTURE_FLOOR_CHECK=0` (as before), else while the card's
+/// use, with what is kept for title buffers and targets and, with frame
+/// generation on, [`framegen_room`], is under the budget. Textures under
+/// the floor were made with no look at the card at all: on an 8 GB card
+/// with frame generation (issue #597) its 1.5 to 2 GB found the card full
+/// and DLSS ran out of memory each frame until the host failed.
+#[cfg(windows)]
+fn floor_admits(memory: Option<[u64; 4]>) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::pool::trim_on("VICTORY_TEXTURE_FLOOR_CHECK")) {
+        return true;
+    }
+    let Some([budget, used, ..]) = memory else {
+        return true;
+    };
+    used.saturating_sub(crate::pool::texture_room())
+        + crate::shadow::card_room_kept()
+        + targets_room_kept()
+        + framegen_room()
+        < budget
+}
+
+/// What frame generation takes of the card, for [`floor_admits`]: 1 GiB
+/// while it is asked to run (`VICTORY_FRAMEGEN` or `VICTORY_FSR_FRAMEGEN`
+/// with `VICTORY_FRAMEGEN_X` 2 or more), less than the 1.5 to 2 GB it
+/// takes because once made it is in the card's use already; else none.
+#[cfg(windows)]
+fn framegen_room() -> u64 {
+    static ROOM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ROOM.get_or_init(|| {
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
+        let x = std::env::var("VICTORY_FRAMEGEN_X").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(2);
+        if (on("VICTORY_FRAMEGEN") || on("VICTORY_FSR_FRAMEGEN")) && x >= 2 { 1 << 30 } else { 0 }
+    })
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -1920,16 +1957,27 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// (2026-11-26 diag run 16:28, 10:59:54: 8,722 MB in use + 836 MB kept
 /// for targets against a line of 9,527 MB). The reserve comes back when
 /// the targets grow by 64 MiB again (a new scene's), for as long again.
+///
+/// Unless `VICTORY_CARD_ROOM_FOR_TARGETS_MB` is set, the reserve is no more
+/// than a quarter of the card's budget, and it goes once the targets hold
+/// half of that or 1 GiB (`VICTORY_TARGETS_ROOM_SCALE`, on; 0: 3,072 MB and
+/// half of it, as before): with the Series S profile the targets level off
+/// at 1.42 to 1.49 GB, under the 1,536 MB that gave it back, and 1.6 to
+/// 1.7 GB of an 8 GB card's 7 GB budget stayed kept for targets that never
+/// came while textures waited (issue #609).
 #[cfg(windows)]
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map(|mb| mb.min(8192) << 20)
     });
+    static SCALE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let scale = set.is_none() && *SCALE.get_or_init(|| crate::pool::trim_on("VICTORY_TARGETS_ROOM_SCALE"));
+    let (most, release_at) = targets_most(set, crate::pool::budget(), scale);
     static SETTLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let settle = *SETTLE.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS")
@@ -1947,7 +1995,24 @@ pub(crate) fn targets_room_kept() -> u64 {
     let (last, since) = targets_seen(last, since, targets, now);
     GREW[0].store(last, Relaxed);
     GREW[1].store(since, Relaxed);
-    targets_kept(most, targets, now.saturating_sub(since), settle)
+    targets_kept(most, targets, now.saturating_sub(since), settle, release_at)
+}
+
+/// The most [`targets_room_kept`] keeps for targets, and what they must
+/// hold for it to go once they settle: `set` if given, else 3,072 MiB, with
+/// `scale` no more than a quarter of `budget`, given up at half of that or
+/// 1 GiB, whichever is less (the targets before the world are 652 MB).
+#[cfg(any(windows, test))]
+fn targets_most(set: Option<u64>, budget: Option<u64>, scale: bool) -> (u64, u64) {
+    const GIB: u64 = 1 << 30;
+    let most = set.unwrap_or(3072 << 20);
+    match budget {
+        Some(budget) if scale => {
+            let most = most.min(budget / 4);
+            (most, (most / 2).min(GIB))
+        }
+        _ => (most, most / 2),
+    }
 }
 
 /// [`targets_room_kept`]'s record of the targets' bytes (`last`) and of
@@ -1967,11 +2032,11 @@ fn targets_seen(last: u64, since: u64, targets: u64, now: u64) -> (u64, u64) {
 }
 
 /// What [`targets_room_kept`] keeps of `most`: what the targets do not
-/// hold yet, or nothing once they hold half of it or more and have not
+/// hold yet, or nothing once they hold `release_at` or more and have not
 /// grown for `settle` ms (`still_ms`; `settle` 0: always kept).
 #[cfg(any(windows, test))]
-fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64) -> u64 {
-    if settle > 0 && targets >= most / 2 && still_ms >= settle {
+fn targets_kept(most: u64, targets: u64, still_ms: u64, settle: u64, release_at: u64) -> u64 {
+    if settle > 0 && targets >= release_at && still_ms >= settle {
         0
     } else {
         most.saturating_sub(targets)
@@ -2049,8 +2114,18 @@ pub(crate) fn room_line(budget: u64) -> u64 {
     if *SET.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_some()) {
         budget / 100 * room_percent()
     } else {
-        line_for(budget)
+        static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        line_for_with(budget, *SMALL.get_or_init(|| crate::pool::trim_on("VICTORY_SMALL_CARD_LINE")))
     }
+}
+
+/// [`line_for`], and with `small` 85 % of a budget of 7.5 GiB or less (an
+/// 8 GB card's is about 7 GB; `VICTORY_SMALL_CARD_LINE=0`: 90 %, as
+/// before). At 90 % an 8 GB card went over its budget in 66 of 91
+/// readings, by up to 356 MB; at 85 % in 1 of 220 (issue #609).
+#[cfg(any(windows, test))]
+fn line_for_with(budget: u64, small: bool) -> u64 {
+    if small && budget <= 7680 << 20 { budget / 100 * 85 } else { line_for(budget) }
 }
 
 /// The budget less what is left free for the host's own needs that are
@@ -2282,6 +2357,15 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     }
 }
 
+/// Whether the look for idle textures over the line takes those of the
+/// emptiest blocks of textures first (`VICTORY_POOL_DRAIN`, on; 0: the
+/// longest idle first, as before).
+#[cfg(windows)]
+fn drain_sparse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::pool::trim_on("VICTORY_POOL_DRAIN"))
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2330,7 +2414,9 @@ pub(crate) fn let_go_idle() {
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
         Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
+            // (Holes in blocks past what [`crate::pool::texture_room_counted`]
+            // allows count as used, as the system counts them.)
+            let used = used.saturating_sub(crate::pool::texture_room_counted())
                 + crate::shadow::card_room_kept()
                 + targets_room_kept();
             crate::host::vram_keep_below(budget, used, room_line(budget))
@@ -2341,15 +2427,28 @@ pub(crate) fn let_go_idle() {
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
     let all = textures();
-    // With a limit, the longest idle first.
-    let mut by_age: Vec<(u64, usize)> = Vec::new();
+    // With a limit, the longest idle first; with [`drain_sparse`], those
+    // of the emptiest blocks of textures first (the bytes their block
+    // holds, by 8 MiB; textures of their own count as none), so that the
+    // blocks empty and go.
+    let mut by_age: Vec<(u64, u64, usize)> = Vec::new();
     if most != u64::MAX {
+        let held = if drain_sparse() { crate::pool::blocks_held() } else { Vec::new() };
         for &at in all.iter() {
             // SAFETY: as below.
             let r = unsafe { &*(at as *const Resource) };
             let used = r.host.used.load(Relaxed);
             if used != 0 && fills(&r.desc) && crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
-                by_age.push((used & 0xffff_ffff, at));
+                let bucket = if held.is_empty() {
+                    0
+                } else {
+                    // (Not waited for: one being used now is no idle one.)
+                    let block = r.host.made.try_lock().ok().and_then(|made| {
+                        made.as_ref().and_then(|(host, _)| crate::pool::block_of(&host.texture))
+                    });
+                    block.and_then(|b| held.get(b).copied()).map_or(0, |bytes| (bytes >> 23) + 1)
+                };
+                by_age.push((bucket, used & 0xffff_ffff, at));
             }
         }
         by_age.sort_unstable();
@@ -2371,7 +2470,7 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, at)| at)) {
+    for at in all.range(from..).take(part).copied().chain(by_age.iter().map(|&(_, _, at)| at)) {
         if bytes >= most {
             break;
         }
@@ -5210,6 +5309,10 @@ float4 lit() : SV_Target { return 1.0; }
         // 6 GB: 90 % (768 MiB would be more than a tenth).
         assert_eq!(line_for(6_000 * MIB), 6_000 * MIB / 100 * 90);
         assert_eq!(line_for(0), 0);
+        // Cards of 8 GB and less: 85 %, with the switch.
+        assert_eq!(line_for_with(7_038 * MIB, true), 7_038 * MIB / 100 * 85);
+        assert_eq!(line_for_with(7_038 * MIB, false), line_for(7_038 * MIB));
+        assert_eq!(line_for_with(10_600 * MIB, true), 9_832 * MIB);
     }
 
     /// The room kept for render targets goes once the world's targets are
@@ -5218,14 +5321,31 @@ float4 lit() : SV_Target { return 1.0; }
     fn room_for_targets_is_given_up_once_they_settle() {
         const MIB: u64 = 1 << 20;
         let most = 3072 * MIB;
+        let half = most / 2;
         // Before the world: kept, however long.
-        assert_eq!(targets_kept(most, 652 * MIB, 60_000, 20_000), 2420 * MIB);
+        assert_eq!(targets_kept(most, 652 * MIB, 60_000, 20_000, half), 2420 * MIB);
         // The world's first frames: still growing.
-        assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000), 989 * MIB);
+        assert_eq!(targets_kept(most, 2083 * MIB, 5_000, 20_000, half), 989 * MIB);
         // Settled: nothing kept.
-        assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000), 0);
+        assert_eq!(targets_kept(most, 2432 * MIB, 20_000, 20_000, half), 0);
         // `VICTORY_CARD_ROOM_FOR_TARGETS_SETTLE_MS=0`: kept as before.
-        assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0), 640 * MIB);
+        assert_eq!(targets_kept(most, 2432 * MIB, 600_000, 0, half), 640 * MIB);
+
+        // Series S on an 8 GB card (budget 7,038 MB, issue #609): a
+        // quarter of the budget, given up once 1.45 GB of targets settle.
+        let (small, at) = targets_most(None, Some(7_038 * MIB), true);
+        assert_eq!((small, at), (7_038 * MIB / 4, 7_038 * MIB / 8));
+        assert_eq!(targets_kept(small, 1_450 * MIB, 20_000, 20_000, at), 0);
+        // Before: 3,072 MB, never given up.
+        let (old, old_at) = targets_most(None, Some(7_038 * MIB), false);
+        assert_eq!((old, old_at), (most, half));
+        assert_eq!(targets_kept(old, 1_450 * MIB, 600_000, 20_000, old_at), 1_622 * MIB);
+        // A 12 GB card: 2,750 MB at most, given up at 1 GiB.
+        assert_eq!(targets_most(None, Some(11_000 * MIB), true), (2_750 * MIB, 1024 * MIB));
+        // Not before the world's targets.
+        assert_ne!(targets_kept(2_750 * MIB, 652 * MIB, 60_000, 20_000, 1024 * MIB), 0);
+        // Set: as set.
+        assert_eq!(targets_most(Some(1600 * MIB), Some(7_038 * MIB), false), (1600 * MIB, 800 * MIB));
 
         // Growth of 64 MiB restarts the clock; less does not.
         assert_eq!(targets_seen(2000 * MIB, 1_000, 2050 * MIB, 9_000), (2000 * MIB, 1_000));

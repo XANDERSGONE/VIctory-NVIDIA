@@ -218,6 +218,7 @@ fn a_piece_lands_what_the_card_wrote_in_its_parts() {
 /// takes the card's bytes (`take`) or not.
 #[test]
 fn a_piece_waits_for_a_change_of_mapping() {
+    let _serial = crate::watch::mapping_test_lock();
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
     assert!(crate::safecopy::on());
     // SAFETY: a reservation of ours, nothing of it committed.
