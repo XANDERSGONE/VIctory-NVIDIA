@@ -10751,15 +10751,6 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
-    /// The card's own memory in bytes (`DedicatedVideoMemory`), as the
-    /// driver reports it: a little under the size on the box.
-    pub(crate) fn card_own_memory(&self) -> Option<u64> {
-        let adapter = self.adapter.as_ref()?;
-        // SAFETY: a plain query that fills a structure.
-        let desc = unsafe { adapter.GetDesc1() }.ok()?;
-        Some(desc.DedicatedVideoMemory as u64)
-    }
-
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
