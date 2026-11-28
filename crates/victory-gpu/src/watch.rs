@@ -3973,6 +3973,7 @@ mod tests {
     /// the runtime has begun to change; after that it is again.
     #[test]
     fn what_is_left_alone_is_no_known_hole() {
+        let _serial = super::mapping_test_lock();
         let p = placeholder(3);
         let known = |block: usize| published(p + block * BLOCK, p + (block + 1) * BLOCK);
         let ask = || writes(p, p + 3 * BLOCK, true).expect("as a view");
@@ -4013,6 +4014,7 @@ mod tests {
     /// begun to unmap: no note of it stays behind.
     #[test]
     fn nothing_is_guarded_between_our_forgetting_it_and_its_unmapping() {
+        let _serial = super::mapping_test_lock();
         use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
         // SAFETY: a pagefile section of a block, mapped read-write.
         let view = unsafe {
@@ -4701,6 +4703,7 @@ mod tests {
     /// as written at each asking, at every view of it, until it has rested.
     #[test]
     fn a_block_just_written_rests() {
+        let _serial = super::mapping_test_lock();
         let (section, one, two) = two_views(BLOCK);
         let page = one / PAGE;
         let rests = |rests: bool| REST_IN_TEST.set(std::time::Duration::from_secs(if rests { 3600 } else { 0 }));
@@ -5029,6 +5032,7 @@ mod tests {
     /// count as written wherever else they are shown.
     #[test]
     fn a_view_being_split_leaves_its_pages_unguarded_elsewhere() {
+        let _serial = super::mapping_test_lock();
         const SIZE: usize = 3 * BLOCK;
         let (section, one, two) = two_views(SIZE);
         let pages: Vec<usize> = (0..3).map(|k| one / PAGE + k).collect();
@@ -5230,8 +5234,9 @@ mod tests {
 }
 
 /// Tests that hold title memory still, or change its mapping, on purpose
-/// take this first: they run in one process, and a read of all of title
-/// memory in one made a change of other memory in the next wait.
+/// take this first: they run in one process, and changes are one at a time,
+/// so one test's change of all of title memory, waiting for another test's
+/// read, kept that test's change of other memory waiting behind it.
 #[cfg(test)]
 pub(crate) static MAPPING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -5446,6 +5451,7 @@ mod many_askers_tests {
     /// view and of three, resting and not.
     #[test]
     fn no_write_is_lost_when_faults_take_no_lock() {
+        let _serial = super::mapping_test_lock();
         const ALL: u32 = u32::MAX;
         const HALF: u32 = 0x5555_5555;
         writes_to_views_are_not_lost::<1>(0, ALL);
