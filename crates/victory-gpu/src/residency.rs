@@ -107,8 +107,9 @@ pub(crate) fn total_ram() -> Option<u64> {
 /// page file and halved the frame rate. `VICTORY_LOW_RAM=1` turns it on
 /// on any PC, `VICTORY_LOW_RAM=0` off. With it, unless their own switches
 /// say otherwise: command allocators taken anew now and then
-/// (`crate::host::allocator_trim`), and fewer empty staging blocks kept
-/// (`crate::pool`).
+/// (`crate::host::allocator_trim`), fewer empty staging blocks kept
+/// (`crate::pool`), and title memory windows in the card's memory the CPU
+/// maps, scaled to the card (`crate::shadow`, `VICTORY_WINDOWS_BAR_MB`).
 pub(crate) fn low_ram() -> bool {
     static LOW: OnceLock<bool> = OnceLock::new();
     *LOW.get_or_init(|| match switch("VICTORY_LOW_RAM") {
