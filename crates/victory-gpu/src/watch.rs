@@ -5229,6 +5229,17 @@ mod tests {
     }
 }
 
+/// Tests that hold title memory still, or change its mapping, on purpose
+/// take this first: they run in one process, and a read of all of title
+/// memory in one made a change of other memory in the next wait.
+#[cfg(test)]
+pub(crate) static MAPPING_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn mapping_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    MAPPING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod mapping_tests {
     use super::{
@@ -5243,6 +5254,7 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _serial = super::mapping_test_lock();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
@@ -5291,7 +5303,11 @@ mod mapping_tests {
         if !mapping_ranges() {
             return; // VICTORY_MAPPING_RANGES=0: the test above
         }
+        let _serial = super::mapping_test_lock();
         let wait = Duration::from_millis(100);
+        // A change that should go ahead is given longer: other tests in the
+        // process read title memory for a moment now and then.
+        let ahead = Duration::from_secs(5);
         // A read of one range: a change of another goes ahead, a change of
         // part of it (or of all memory) waits for it.
         for (changes, waits) in [
@@ -5305,7 +5321,7 @@ mod mapping_tests {
                 let _changing = title_memory_remapping_where(|| changes);
                 done.send(()).unwrap();
             });
-            assert_eq!(ended.recv_timeout(wait).is_err(), waits);
+            assert_eq!(ended.recv_timeout(if waits { wait } else { ahead }).is_err(), waits);
             drop(reading);
             ended.recv().unwrap();
             change.join().unwrap();
@@ -5320,7 +5336,11 @@ mod mapping_tests {
             stopped.recv().unwrap();
         });
         waiting.recv().unwrap();
-        assert!(title_memory_reading_range_now(0x20000..0x30000).is_some());
+        let deadline = std::time::Instant::now() + ahead;
+        while title_memory_reading_range_now(0x20000..0x30000).is_none() {
+            assert!(std::time::Instant::now() < deadline, "a read of other memory did not begin");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(title_memory_reading_range_now(0x1f000..0x21000).is_none());
         drop(title_memory_reading_range(0x40000..0x50000));
         let read = Arc::new(AtomicBool::new(false));

@@ -2813,6 +2813,7 @@ mod merge_tests {
     /// changes a mapping; a page that stays away loses it, and nothing else.
     #[test]
     fn a_put_waits_for_a_change_of_mapping() {
+        let _serial = crate::watch::mapping_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
