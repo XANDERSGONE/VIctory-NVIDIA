@@ -1249,9 +1249,10 @@ impl TextureQueue {
 
     /// Up to `max` slots due at `frame`, each with its write number, in
     /// the order to serve them:
-    /// - first the ones looked at before (their memory was not mapped, or
-    ///   only part of it): the look is a query, and memory that has
-    ///   arrived since is what the title streamed in last;
+    /// - the ones looked at before (their memory was not mapped, or only
+    ///   part of it): the look is a query, and memory that has arrived
+    ///   since is what the title streamed in last; in turns with the others
+    ///   ([`fair_queue`]; `VICTORY_TEXTURE_FAIR_QUEUE=0`: all of them first);
     /// - then the others, the newest write first and the oldest next, in
     ///   turns: slot order served the low slots of a backlog of
     ///   25,000-40,000 while the textures of the shot on screen waited
@@ -1271,7 +1272,7 @@ impl TextureQueue {
     /// title's recording threads, whose every descriptor copy notes its slot
     /// here, waited that long behind it (run timeline, 2026-11-26).
     fn due_and_census(&self, frame: u64) -> (Due, [u64; 6]) {
-        let mut due = Due::default();
+        let mut due = Due { frame, ..Due::default() };
         let mut c = [self.slots.len() as u64, 0, 0, 0, 0, 0];
         for (&index, w) in &self.slots {
             let again = w.checked.2 != 0;
@@ -1328,6 +1329,26 @@ pub(crate) enum Told {
 struct Due {
     again: Vec<(u64, u32, u64, Option<Checked>)>,
     fresh: Vec<(u64, u32, u64)>,
+    /// The frame they are due at: which of the two goes first
+    /// ([`fair_queue`]).
+    frame: u64,
+}
+
+/// Whether the slots looked at before and the slots never looked at take
+/// turns in a pass ([`Due::ordered`]), the first of a pass from one and
+/// then the other frame by frame (`VICTORY_TEXTURE_FAIR_QUEUE=0`: all those
+/// looked at before first, as before).
+///
+/// The pass stops at its time (`VICTORY_TEXSPK_PASS_MS`, 8 ms a frame in
+/// `play.rs`) or its bytes. With those looked at before all first, a
+/// backlog of them (textures partly streamed in, rechecks of textures
+/// uploaded whole) could take every pass while textures never uploaded
+/// stayed dark: DexNom saw dark materials on a waterfront while thousands
+/// of slots waited (DexNom/VIctory 5f4c3df, "New textures and retries
+/// share the upload budget"; ported with credit, GPL-3.0).
+fn fair_queue() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FAIR_QUEUE").is_none_or(|v| v != "0"))
 }
 
 impl Due {
@@ -1340,23 +1361,63 @@ impl Due {
     /// [`Due::order`], and beside it what [`TextureQueue::checked`] said of
     /// each when they were taken.
     fn ordered(self, max: usize) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
-        let Due { mut again, mut fresh } = self;
+        self.ordered_as(max, fair_queue())
+    }
+
+    /// [`Due::ordered`]; `fair`: as [`fair_queue`] says.
+    fn ordered_as(self, max: usize, fair: bool) -> (Vec<(u32, u64)>, Vec<Option<Checked>>) {
+        let Due { mut again, mut fresh, frame } = self;
         // By the number of the write, counted over the run.
         again.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
         fresh.sort_unstable_by_key(|e| std::cmp::Reverse(e.2));
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
-        let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
+        // Those never looked at: the newest write and the oldest in turns.
+        let mut turns = Vec::with_capacity(fresh.len().min(max));
         let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
+        while new < old && turns.len() < max {
+            turns.push((fresh[new].1, fresh[new].2));
             new += 1;
-            if new < old && order.len() < max {
+            if new < old && turns.len() < max {
                 old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+                turns.push((fresh[old].1, fresh[old].2));
             }
         }
-        order.truncate(max);
-        known.resize(order.len(), None);
+        if !fair {
+            let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write, _)| (index, write)).collect();
+            let mut known: Vec<Option<Checked>> = again.iter().map(|a| a.3).collect();
+            order.extend(turns);
+            order.truncate(max);
+            known.resize(order.len(), None);
+            return (order, known);
+        }
+        // One of each in turns, the first from those looked at before on
+        // even frames and from the others on odd ones: a pass that stops
+        // after one slot serves both, frame by frame.
+        let count = max.min(again.len() + turns.len());
+        let mut order = Vec::with_capacity(count);
+        let mut known = Vec::with_capacity(count);
+        let (mut again, mut turns) = (again.into_iter(), turns.into_iter());
+        let mut retry = frame.is_multiple_of(2);
+        while order.len() < count {
+            let next = if retry { again.next() } else { None };
+            match next {
+                Some((_, index, write, checked)) => {
+                    order.push((index, write));
+                    known.push(checked);
+                }
+                None => match turns.next() {
+                    Some(fresh) => {
+                        order.push(fresh);
+                        known.push(None);
+                    }
+                    None => {
+                        let Some((_, index, write, checked)) = again.next() else { break };
+                        order.push((index, write));
+                        known.push(checked);
+                    }
+                },
+            }
+            retry = !retry;
+        }
         (order, known)
     }
 }
@@ -6719,6 +6780,63 @@ mod tests {
         assert_eq!(known.iter().filter(|k| k.is_some()).count(), 1);
         let (order, known) = q.due_and_census(u64::MAX).0.ordered(1);
         assert_eq!((order.len(), known.len()), (1, 1));
+    }
+
+    /// Slots looked at before and slots never looked at take turns in a
+    /// pass, the first from those looked at before on even frames and from
+    /// the others on odd ones, each kind in its own order; with
+    /// `VICTORY_TEXTURE_FAIR_QUEUE=0` those looked at before all come first.
+    /// What is known of each slot stays beside it. (DexNom/VIctory 5f4c3df.)
+    #[test]
+    fn slots_looked_at_before_take_turns_with_new_ones() {
+        let mut q = TextureQueue::default();
+        // Slots 40..44 written in frames 1..5; slots 50..56 in frames 6..12.
+        for i in 0..4u32 {
+            q.written(40 + i, u64::from(i) + 1, 0, false);
+        }
+        for i in 0..6u32 {
+            q.written(50 + i, u64::from(i) + 6, 0, false);
+        }
+        let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
+        // 40..44 were looked at: 40 and 41 not there, 42 partly there, 43
+        // uploaded whole and due for a look again.
+        for i in [40, 41] {
+            let w = write(&q, i);
+            q.later(i, w, 1, 4);
+        }
+        let w42 = write(&q, 42);
+        q.partly(42, w42, 1, 4096);
+        let w43 = write(&q, 43);
+        q.recheck(43, w43, 1, (0x4_0000, 4096), 3, 0, 1);
+        let at = |frame: u64, max: usize, fair: bool| {
+            let (order, known) = q.due_and_census(frame).0.ordered_as(max, fair);
+            assert_eq!(order.len(), known.len());
+            for (&(index, _), knew) in order.iter().zip(&known) {
+                assert_eq!(*knew, q.checked(index));
+            }
+            order.into_iter().map(|d| d.0).collect::<Vec<u32>>()
+        };
+        // Looked at before, newest write first: 43, 42, 41, 40. Never
+        // looked at: newest and oldest in turns, 55, 50, 54, 51, 53, 52.
+        assert_eq!(at(10, 100, false), [43, 42, 41, 40, 55, 50, 54, 51, 53, 52]);
+        assert_eq!(at(10, 100, true), [43, 55, 42, 50, 41, 54, 40, 51, 53, 52]);
+        assert_eq!(at(11, 100, true), [55, 43, 50, 42, 54, 41, 51, 40, 53, 52]);
+        // A pass that stops after one slot serves both kinds, frame by frame.
+        assert_eq!(at(10, 1, true), [43]);
+        assert_eq!(at(11, 1, true), [55]);
+        assert_eq!(at(11, 1, false), [43]);
+        // Cut to `max` after the turns.
+        assert_eq!(at(10, 4, true), [43, 55, 42, 50]);
+        assert_eq!(at(10, 4, false), [43, 42, 41, 40]);
+        // Only one kind due: it alone, in its order.
+        let mut fresh_only = TextureQueue::default();
+        for i in 0..3u32 {
+            fresh_only.written(60 + i, u64::from(i) + 1, 0, false);
+        }
+        for frame in [10, 11] {
+            let (order, _) = fresh_only.due_and_census(frame).0.ordered_as(100, true);
+            assert_eq!(order.into_iter().map(|d| d.0).collect::<Vec<_>>(), [62, 60, 61]);
+        }
     }
 
     /// What the pass tells of several slots under one take of the lock ends
