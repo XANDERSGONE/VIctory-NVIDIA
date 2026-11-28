@@ -1,0 +1,93 @@
+# Fork-only test builds: compiles victory.exe on Windows and posts it as a
+# prerelease, so testers can A/B a branch against the latest official
+# release without installing Rust. Lint and tests are skipped on purpose;
+# CI (ci.yml) is where those run.
+#
+# Two ways to start it:
+#   - push a tag named test-build-* on a commit that has this file;
+#   - Actions > Test build > Run workflow (only once this file is on the
+#     default branch), naming the branch to build.
+name: Test build
+
+on:
+  push:
+    tags: ["test-build-*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build (empty = the branch you run it from)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: test-build-${{ github.ref }}-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+      # The version and target pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test-build
+      - name: Build victory.exe
+        run: cargo build --release --locked -p victory
+      - name: Publish prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          short=$(git rev-parse --short=7 HEAD)
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ -z "${INPUT_REF}" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="test-build-$(date -u +%Y%m%d)-${short}"
+          fi
+          branch="${INPUT_REF}"
+          if [ -z "$branch" ] && [ "${GITHUB_REF_TYPE}" = "branch" ]; then
+            branch="${GITHUB_REF_NAME}"
+          fi
+          if [ -z "$branch" ]; then
+            branch=$(git branch -r --points-at HEAD | grep -v HEAD | sed 's#^ *origin/##' | paste -sd, - || true)
+          fi
+          [ -n "$branch" ] || branch="(no branch tip; see the commit)"
+
+          mkdir dist
+          cp target/release/victory.exe dist/victory.exe
+          (cd dist && sha256sum victory.exe > victory.exe.sha256)
+
+          cat > notes.md <<EOF
+          **Test build, not an official VIctory release.**
+
+          For A/B testing against upstream's latest release
+          (https://github.com/trustno1-coder/VIctory-NVIDIA/releases/latest).
+
+          - Branch: \`${branch}\`
+          - Commit: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${sha}
+          - Built by: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+
+          Download \`victory.exe\` and use it in place of the official one.
+          EOF
+
+          gh release create "$tag" dist/victory.exe dist/victory.exe.sha256 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "$sha" \
+            --prerelease \
+            --title "Test build ${short} (${branch})" \
+            --notes-file notes.md
