@@ -21,7 +21,9 @@
 //!   given before, in the same order, with every fence value higher than the
 //!   one before ([`give`]). The lists of copies in the card's memory that go
 //!   ahead of a submission (`Host::card_before`) go through it too.
-//! - Only who holds the submission lock gives it work. A submission is in
+//! - Only who holds the submission lock gives it lists to send (the
+//!   mapping of tiles, and the landing of flights, which reaches no queue,
+//!   are given by others: below, and [`land`]). A submission is in
 //!   the line of flights (`line()`) before the lock is let go, as before, so
 //!   whatever the next submission looks at (what flights may write, which of
 //!   them it waits for) sees it; a wait for a flight not given to the queue
@@ -42,11 +44,15 @@
 //!
 //! Level 2 takes the textures given host copies so far when the submission
 //! is given, not when the round of its heaps' records is over: a texture made
-//! by that round itself has its slots made before the next submission.
+//! by that round itself has its slots made before the next submission, so
+//! it shows a submission later than at level 1, never earlier. (Taking them
+//! when the round is over would take some of the next submission's too.)
 //!
 //! Off where the order of the queue says more than this: without the relay's
 //! second stage and its fetches over the copy queue (a fetch on the drawing
-//! queue is numbered against the sends to copies in the card's memory), with
+//! queue is numbered against the sends to copies in the card's memory; where
+//! no copy queue could be made, such a fetch empties the sender with that
+//! numbering held), with
 //! a second queue planned (`VICTORY_ASYNC_QUEUE`), and with the present not
 //! sent ahead.
 

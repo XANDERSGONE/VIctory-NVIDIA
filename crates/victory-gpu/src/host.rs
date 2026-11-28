@@ -5296,9 +5296,12 @@ impl Host {
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
-                // (Never with the sender on, which needs the copy queue.)
-                sender::drain();
+                // With the sender on (here when no copy queue could be
+                // made), what it was given is sent first, the order held:
+                // a send numbered under the order may still be in its line.
+                // (No item of the sender's takes the order.)
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                sender::drain();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
