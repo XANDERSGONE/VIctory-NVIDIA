@@ -44,6 +44,11 @@ struct Queue {
 }
 const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 
+/// The list type of a queue that draws (D3D12's direct type; 2 is compute,
+/// 3 copy): the queue a frame's render submissions go to.
+#[cfg(windows)]
+const DIRECT: u32 = 0;
+
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
@@ -597,9 +602,29 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    execute_tagged(this, count, lists, 0);
+}
+
+/// [`execute`] for lists the title tags with the frame token `token` (0:
+/// none).
+fn execute_tagged(this: This, count: u32, lists: *const This, token: u64) {
     if lists.is_null() {
         return;
     }
+    // `VICTORY_REFLEX`: a frame's first submission ends its simulation and
+    // begins its submissions. Marked here, at the title's call and on its
+    // thread, whichever way the lists then go (at once, held by a queue, or
+    // into the line of a thread of ours). Only for a queue that draws: what
+    // a streaming or upload thread sends to a copy or compute queue is not
+    // the frame's render submission, and taken for it, it would end the
+    // newest frame's simulation right after its sleep, before the title
+    // has read its input. Nothing without the switch.
+    #[cfg(windows)]
+    if !this.is_null() && queue(this).kind == DIRECT {
+        crate::streamline::title_submits(token);
+    }
+    #[cfg(not(windows))]
+    let _ = token;
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::title_thread();
@@ -720,8 +745,9 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
-    execute(this, count, lists);
+/// (The token names the frame for Reflex's markers, with `VICTORY_REFLEX`.)
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, _flags: u32) {
+    execute_tagged(this, count, lists, token);
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
@@ -957,6 +983,21 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // `VICTORY_REFLEX`: this present is bound to the frame it shows, here in
+    // the title's order (the host's present may come later, on the line's
+    // thread, when the title has begun its next frame): by the frame token
+    // of the first plane if the title gives one, else by order.
+    #[cfg(windows)]
+    if crate::streamline::reflex_marking() {
+        let token = if planes > 0 {
+            // SAFETY: the title passes `planes` plane descriptions (null is
+            // tolerated).
+            unsafe { plane_parameters.as_ref() }.map_or(0, |plane| plane.token)
+        } else {
+            0
+        };
+        crate::streamline::title_presents(frame, token);
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
