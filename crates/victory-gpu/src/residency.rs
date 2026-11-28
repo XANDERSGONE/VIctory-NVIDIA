@@ -15,6 +15,11 @@ fn memory_status() -> Option<MEMORYSTATUSEX> {
     (unsafe { GlobalMemoryStatusEx(&mut status) } != 0).then_some(status)
 }
 
+/// The PC's RAM in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn total_host_ram() -> Option<u64> {
+    memory_status().map(|s| s.ullTotalPhys)
+}
+
 // The texture sweep may run for seconds inside a single submitted frame.
 static NEXT_COMMIT_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static AVAILABLE_COMMIT: AtomicU64 = AtomicU64::new(u64::MAX);
