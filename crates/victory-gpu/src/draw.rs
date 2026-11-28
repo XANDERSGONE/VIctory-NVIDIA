@@ -418,7 +418,7 @@ const WINDOW_MOST: u64 = 64;
 /// budgets on them and emptied the draws after), so in a window a record
 /// that asks for more than can run is left empty and charges nothing
 /// (`crate::indirect::bound_ahead`); a tail record that looks real is
-/// charged what it asks, a few thousand of 2^27. And arguments the title's CPU side changes are seen as
+/// charged what it asks, a few thousand of 2^30. And arguments the title's CPU side changes are seen as
 /// before, at the next submission.
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -540,6 +540,11 @@ pub(crate) struct State {
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
     host_heaps_set: bool,
+    /// The tail of the bound sampler heap that holds the tables of the
+    /// pipelines' samplers (`VICTORY_PIPELINE_SAMPLER_TABLE`), and how many
+    /// of the blocks this list has seen written into it.
+    sampler_tail: Option<crate::pipeline::host::SamplerTail>,
+    sampler_seen: usize,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1581,6 +1586,8 @@ impl State {
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_heaps_set = false;
+        self.sampler_tail = None;
+        self.sampler_seen = 0;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1885,6 +1892,9 @@ impl State {
         if !self.host_heaps_set || self.host_heaps != self.heaps {
             let mut view_heap: Option<ID3D12DescriptorHeap> = None;
             let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
+            // Where the title's slots end in the sampler heap bound, for the
+            // tables of the pipelines' samplers.
+            let mut tail_from = 0;
             for &h in &self.heaps {
                 if h == 0 {
                     continue;
@@ -1893,6 +1903,7 @@ impl State {
                 if let Some(host_heap) = title_heap.host() {
                     if title_heap.samplers() {
                         sampler_heap = Some(host_heap.heap.clone());
+                        tail_from = host_heap.count();
                     } else {
                         view_heap = Some(host_heap.heap.clone());
                     }
@@ -1901,9 +1912,18 @@ impl State {
             if view_heap.is_none() {
                 view_heap = crate::host::host().and_then(|h| h.fallback_view_heap().cloned());
             }
+            if sampler_heap.is_none() && crate::pipeline::host::sampler_table() {
+                // Our own long heap, so that the tables have a place.
+                sampler_heap = crate::pipeline::host::table_heap().cloned();
+            }
             if sampler_heap.is_none() {
                 sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
             }
+            self.sampler_tail = sampler_heap
+                .as_ref()
+                .filter(|_| crate::pipeline::host::sampler_table())
+                .and_then(|h| crate::pipeline::host::SamplerTail::new(h, tail_from));
+            self.sampler_seen = 0;
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
             if let Some(h) = view_heap {
                 list.keep(&h);
@@ -1960,6 +1980,9 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                return false;
+            }
+            if !self.sampler_table(list, stage, compute) {
                 return false;
             }
             if stage.shader.ambient.is_some() {
@@ -2154,6 +2177,38 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        true
+    }
+
+    /// Binds the table of a stage's immediate samplers
+    /// (`VICTORY_PIPELINE_SAMPLER_TABLE`): the blocks not yet written into
+    /// the bound sampler heap are written, once per heap, and the table
+    /// parameter points at the stage's block in its tail. True if the stage
+    /// has none. False, counted, if the heap has no room for the block (a
+    /// sampler heap made without the tail): the draw is dropped, never
+    /// drawn through other samplers.
+    fn sampler_table(&mut self, list: &HostList, stage: &crate::pipeline::host::Stage, compute: bool) -> bool {
+        let Some((param, offset, n)) = stage.samplers else { return true };
+        let handle = self.sampler_tail.as_ref().and_then(|tail| {
+            if self.sampler_seen < crate::pipeline::host::sampler_blocks() {
+                self.sampler_seen = tail.fill();
+            }
+            tail.handle(offset, n)
+        });
+        let Some(handle) = handle else {
+            crate::pipeline::host::sampler_refused();
+            once!("a draw whose sampler table has no room in the sampler heap bound is dropped");
+            return false;
+        };
+        // SAFETY: an open list; the block is in the tail of the bound sampler
+        // heap, written above.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle });
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle });
+            }
+        }
         true
     }
 
@@ -4988,6 +5043,8 @@ impl State {
                 // the world streams a change is under way most of the time,
                 // and this is the thread that submits.
                 let mut read = vec![0u8; n * 3 * stride];
+                // (All of title memory: a read in place may fault into a view
+                // kept in the books, `crate::watch::mapping_ranges`.)
                 let held = (!crate::host::read_into(from as *const u8, &mut read)).then(crate::watch::title_memory_reading);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.

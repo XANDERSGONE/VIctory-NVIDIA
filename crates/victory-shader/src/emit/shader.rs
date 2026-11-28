@@ -317,6 +317,10 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        #[cfg(test)]
+        if name == "barrier" {
+            BARRIER_OPS.set(BARRIER_OPS.get() + 1);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -1010,4 +1014,10 @@ impl Shader {
         }
         Some(self.m.md_node(list))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Barrier operations this thread emitted (`barrier_trim_tests`).
+    pub(super) static BARRIER_OPS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }

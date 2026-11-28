@@ -201,6 +201,11 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
+    // All of title memory, not the texture's range alone: the write below
+    // may make a view kept in the books real (`crate::host::copy_mapped`),
+    // which waits for the record of views, and a change of other memory
+    // that held it would wait for the tickets held here
+    // (`crate::watch::mapping_ranges`).
     let _mapping = crate::watch::title_memory_reading();
     let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {

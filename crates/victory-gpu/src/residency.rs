@@ -95,6 +95,43 @@ pub(crate) fn limited_host_ram() -> bool {
     *LIMITED.get_or_init(|| memory_status().is_some_and(|s| s.ullTotalPhys <= 32 * GIB))
 }
 
+/// The PC's physical memory in bytes, read once.
+pub(crate) fn total_ram() -> Option<u64> {
+    static TOTAL: OnceLock<Option<u64>> = OnceLock::new();
+    *TOTAL.get_or_init(|| memory_status().map(|s| s.ullTotalPhys))
+}
+
+/// Whether the layer's own memory is kept short by default: on PCs with
+/// less than 24 GiB (a 16 GB PC reports about 15.9), where the layer's
+/// command allocators and spare upload blocks pushed the game into the
+/// page file and halved the frame rate. `VICTORY_LOW_RAM=1` turns it on
+/// on any PC, `VICTORY_LOW_RAM=0` off. With it, unless their own switches
+/// say otherwise: command allocators taken anew now and then
+/// (`crate::host::allocator_trim`), fewer empty staging blocks kept
+/// (`crate::pool`), and title memory windows in the card's memory the CPU
+/// maps, scaled to the card (`crate::shadow`, `VICTORY_WINDOWS_BAR_MB`).
+pub(crate) fn low_ram() -> bool {
+    static LOW: OnceLock<bool> = OnceLock::new();
+    *LOW.get_or_init(|| match switch("VICTORY_LOW_RAM") {
+        Some(on) => on,
+        None => total_ram().is_some_and(low_ram_total),
+    })
+}
+
+fn low_ram_total(total: u64) -> bool {
+    total < 24 * GIB
+}
+
+/// A switch set to 1 (`Some(true)`) or 0 (`Some(false)`); unset or anything
+/// else: `None`, the default.
+pub(crate) fn switch(name: &str) -> Option<bool> {
+    match std::env::var(name).ok()?.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     if was {
         physical < 5 * GIB || commit < 6 * GIB
@@ -175,6 +212,16 @@ mod tests {
             assert_eq!(has_upload_reserve(commit, false), lookahead);
             assert_eq!(has_growth_reserve(commit, false), growth);
         }
+    }
+
+    #[test]
+    fn sixteen_gb_pcs_count_as_low_on_ram_and_32_gb_ones_do_not() {
+        // What 16 GB PCs report, with memory kept by the firmware.
+        assert!(low_ram_total(15_900 * MIB));
+        assert!(low_ram_total(16 * GIB));
+        assert!(low_ram_total(24 * GIB - 1));
+        assert!(!low_ram_total(24 * GIB));
+        assert!(!low_ram_total(32 * GIB));
     }
 
     #[test]

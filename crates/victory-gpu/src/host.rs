@@ -1427,6 +1427,39 @@ fn fresh_open_line(frames: f64) {
     }
 }
 
+/// Every 30 seconds of frames (and with the first one): what the layer did
+/// to keep its own memory short ([`allocator_trim`], `crate::list` idle
+/// lists, spare scratch chunks, `crate::pool` staging blocks), so that a
+/// tester's log shows which build and switches ran.
+fn low_ram_line() {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if (last != 0 && now < last + 30_000)
+        || LAST.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+    let mib = |b: u64| b as f64 / f64::from(1u32 << 20);
+    let trim = allocator_trim().map_or_else(|| "off".to_owned(), |s| format!("every {s} s"));
+    tracing::info!(
+        "layer memory: PC {:.1} GB, low-RAM defaults {} (VICTORY_LOW_RAM=0 off, =1 on); allocator trim {trim} \
+         (VICTORY_ALLOCATOR_TRIM): {} list and {} prelude allocators taken anew, {} idle lists destroyed, \
+         {:.0} MB spare scratch freed since the start; {} host lists alive, {:.0} MB spare scratch kept; \
+         empty staging blocks kept at most {} (VICTORY_STAGING_KEEP)",
+        gib(crate::residency::total_ram().unwrap_or(0)),
+        if crate::residency::low_ram() { "on" } else { "off" },
+        ALLOCATOR_TRIMS[0].load(Ordering::Relaxed),
+        ALLOCATOR_TRIMS[1].load(Ordering::Relaxed),
+        crate::list::TRIMMED_LISTS.load(Ordering::Relaxed),
+        mib(SPARE_TRIMMED.load(Ordering::Relaxed)),
+        ALIVE[0].load(Ordering::Relaxed),
+        mib(ALIVE[4].load(Ordering::Relaxed)),
+        crate::pool::staging_kept(),
+    );
+}
+
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
 /// it; lists that name no texture never have one, and every host list was
@@ -1442,7 +1475,8 @@ fn lazy_prelude() -> bool {
 // patches 13 and 17.
 
 /// Whether host command allocators are taken anew now and then
-/// (`VICTORY_ALLOCATOR_TRIM=1`; off by default), and after how many
+/// (`VICTORY_ALLOCATOR_TRIM=1`; `=0` never; unset: on PCs low on RAM,
+/// [`crate::residency::low_ram`], off on others), and after how many
 /// seconds. A D3D12 command allocator never gives back the memory of the
 /// most its list ever recorded into it: a list that once took a loading
 /// frame's commands keeps that for the run, and upstream 1,600 of them
@@ -1459,7 +1493,8 @@ fn lazy_prelude() -> bool {
 pub(crate) fn allocator_trim() -> Option<u64> {
     static S: OnceLock<Option<u64>> = OnceLock::new();
     *S.get_or_init(|| {
-        std::env::var_os("VICTORY_ALLOCATOR_TRIM").is_some_and(|v| v == "1").then(|| {
+        let on = crate::residency::switch("VICTORY_ALLOCATOR_TRIM").unwrap_or_else(crate::residency::low_ram);
+        on.then(|| {
             std::env::var("VICTORY_ALLOCATOR_TRIM_S")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
@@ -4204,6 +4239,16 @@ mod panel;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
+mod sender;
+pub(crate) use sender::Tiles;
+
+/// Tiles of a reserved texture to be mapped on `queue`: on the host's queue
+/// with the sender on (`VICTORY_SEND_THREAD`), given to it, so that they
+/// reach the queue behind what it was given; else given back, to be mapped
+/// at once.
+pub(crate) fn tiles_in_order(queue: &ID3D12CommandQueue, tiles: Tiles) -> Option<Tiles> {
+    sender::tiles(queue, tiles)
+}
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -4913,7 +4958,15 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let list: ID3D12CommandList = list.cast()?;
+                    if flown && sender::on() {
+                        // In its place among the sends, ahead of the
+                        // submission's lists (`sender`).
+                        sender::lists(vec![Some(list)]);
+                    } else {
+                        sender::drain();
+                        self.queue.ExecuteCommandLists(&[Some(list)]);
+                    }
                     Ok(())
                 })()
             };
@@ -5278,7 +5331,12 @@ impl Host {
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
+                // With the sender on (here when no copy queue could be
+                // made), what it was given is sent first, the order held:
+                // a send numbered under the order may still be in its line.
+                // (No item of the sender's takes the order.)
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                sender::drain();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -5573,6 +5631,7 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    sender::drain();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -5752,8 +5811,13 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        if sender::on() {
+            // The sender does it, behind the sending (`sender`).
+            sender::land();
+        } else {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
         AFTER_SEND.fetch_add(after.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -6240,15 +6304,24 @@ impl Host {
             lists.push(Some(check));
         }
         split.part(4);
-        stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
-        drop(heaps_synced);
-        if crate::heap_marks::on() {
-            crate::heap_marks::heaps_waited(heaps_began.elapsed().as_nanos() as u64);
-        }
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // With the sender's second level (`VICTORY_SEND_THREAD=2`) a
+        // submission sent ahead leaves both to the sender, which does them
+        // before it gives the lists to the queue; the textures made so far
+        // are taken now (`sender`).
+        let heaps_later = if late && sender::level() > 1 {
+            Some((heaps_synced, crate::descriptor::take_made()))
+        } else {
+            stage.next("submit: waiting for the heaps' records");
+            let heaps_began = std::time::Instant::now();
+            drop(heaps_synced);
+            if crate::heap_marks::on() {
+                crate::heap_marks::heaps_waited(heaps_began.elapsed().as_nanos() as u64);
+            }
+            // The slots that waited for a texture's host copy, before the
+            // lists that may read them run.
+            crate::descriptor::make_waiting();
+            None
+        };
         split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
@@ -6272,22 +6345,40 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+            if sender::on() {
+                // Given to the sender, which gives it to the queue in this
+                // order; the flight is noted in the line below as before.
+                #[cfg(feature = "diagnostics")]
+                let _ = sending;
+                sender::run(sender::Run {
+                    lists,
+                    cuts,
+                    value: *submitted,
+                    heaps: heaps_later,
+                    #[cfg(feature = "diagnostics")]
+                    stamp,
+                    #[cfg(feature = "diagnostics")]
+                    compute: two_queues::title_kind() == Some(two_queues::COMPUTE),
+                });
+                stage.next("submit: noting what is in the air");
+            } else {
+                // SAFETY: closed lists; the fence is ours.
+                let signalled = unsafe {
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([lists.len()]) {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                        from = to;
+                    }
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                awake::sent(&self.device);
+                #[cfg(feature = "diagnostics")]
+                crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
+                self.card_sent();
+                stage.next("submit: noting what is in the air");
+                if let Err(e) = signalled {
+                    fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
                 }
-                self.queue.Signal(&self.fence, *submitted)
-            };
-            awake::sent(&self.device);
-            #[cfg(feature = "diagnostics")]
-            crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
-            self.card_sent();
-            stage.next("submit: noting what is in the air");
-            if let Err(e) = signalled {
-                fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
@@ -6326,6 +6417,8 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        // Behind whatever the sender was given (`sender`).
+        sender::drain();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -9638,13 +9731,91 @@ struct Presenter {
     notice: panel::Notice,
     /// The F1 settings menu.
     menu: menu::Menu,
-    /// The swap chain lets a frame be shown at once ([`tearing`]): its flags, kept for
-    /// ResizeBuffers, which may not change them.
-    tearing: bool,
     /// Presents ask for that; off for the rest of the run once one such present is refused.
     presents_tearing: bool,
     /// A refused present was logged.
     present_refused: bool,
+    /// The flags the swap chain was made with: whether it lets a frame be shown at once
+    /// ([`tearing`], [`chain_flags`]) and has a frame latency waitable object
+    /// ([`frame_latency`]). Kept for ResizeBuffers, which may not change them.
+    flags: DXGI_SWAP_CHAIN_FLAG,
+    /// The swap chain's frame latency waitable object ([`frame_latency`]): waited on before
+    /// each frame takes a back buffer.
+    waitable: Option<Waitable>,
+}
+
+/// `VICTORY_FRAME_LATENCY=<1 to 16>`: the swap chain is made with a frame latency waitable
+/// object (`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`), at most that many frames
+/// queued for the screen (`SetMaximumFrameLatency`), and each present waits on the object
+/// before it takes a back buffer, rather than DXGI blocking somewhere inside Present. Unset or
+/// 0: off, as before (DXGI's own latency of 3). Only for the swap chain made without frame
+/// generation: FSR 3's and Streamline's frame generation swap chains pace their own presents.
+/// Why: with frame generation off, presents locked to exactly 66.7 ms (15 fps) while a frame
+/// was about 30 ms of work (upstream #175, #515); a queue of presents blocking at a refresh
+/// is one way frames round up to whole refreshes.
+fn frame_latency() -> Option<u32> {
+    static AT: OnceLock<Option<u32>> = OnceLock::new();
+    *AT.get_or_init(|| {
+        let spec = std::env::var("VICTORY_FRAME_LATENCY").ok()?;
+        let latency = parse_frame_latency(&spec);
+        if latency.is_none() && spec.trim() != "0" && !spec.trim().is_empty() {
+            tracing::warn!(spec, "VICTORY_FRAME_LATENCY: expected 0 (off) or 1 to 16; off");
+        }
+        latency
+    })
+}
+
+/// `"1"` → 1, `"2"` → 2; 0, empty, over 16 or not a number → `None` (off).
+fn parse_frame_latency(spec: &str) -> Option<u32> {
+    spec.trim().parse::<u32>().ok().filter(|n| (1..=16).contains(n))
+}
+
+/// How long a present waits on the waitable object before it takes a back buffer, at most.
+/// Past it the frame goes on all the same (counted as timed out in the log line).
+const LATENCY_WAIT_MS: u32 = 500;
+
+/// For the frame-rate lines: µs waited on the frame latency object, waits, waits timed out.
+static LATENCY_WAITS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A swap chain's frame latency waitable object: closed when dropped.
+struct Waitable(HANDLE);
+
+impl Waitable {
+    /// Waits until the swap chain has room for another frame (or [`LATENCY_WAIT_MS`]).
+    fn wait(&self) {
+        let _waiting = crate::timeline::span("the swap chain's frame latency wait");
+        let began = std::time::Instant::now();
+        // SAFETY: the swap chain's handle, open while `self` lives.
+        let waited = unsafe { WaitForSingleObject(self.0, LATENCY_WAIT_MS) };
+        LATENCY_WAITS[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        LATENCY_WAITS[1].fetch_add(1, Ordering::Relaxed);
+        if waited != WAIT_OBJECT_0 {
+            LATENCY_WAITS[2].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Waitable {
+    fn drop(&mut self) {
+        // SAFETY: ours to close (GetFrameLatencyWaitableObject hands the caller the handle).
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// The frame latency wait's line, with the frame rate's ([`frame_latency`]).
+fn latency_line(frames: f64) {
+    let [us, waits, timeouts] = [0, 1, 2].map(|i| LATENCY_WAITS[i].swap(0, Ordering::Relaxed));
+    if waits == 0 {
+        return;
+    }
+    tracing::info!(
+        "frame latency wait (VICTORY_FRAME_LATENCY={}): {:.2} ms a present waited for a back buffer, {:.2} waits a frame, {timeouts} timed out ({LATENCY_WAIT_MS} ms)",
+        frame_latency().unwrap_or(0),
+        us as f64 / 1000.0 / waits as f64,
+        waits as f64 / frames
+    );
 }
 
 /// Whether the swap chain lets a frame be shown as soon as it is presented, not at the screen's
@@ -9787,12 +9958,13 @@ impl Meter {
         let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^27), the largest cost of one {biggest} (0: under 2^22)"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (2^30), the largest cost of one {biggest} (0: under 2^22)"
         );
         crate::indirect::merge::line(frames);
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        latency_line(frames);
         crate::queue::behind_line(frames);
         crate::streamline::line(frames);
         card_clock_line(frames, ms);
@@ -9801,7 +9973,9 @@ impl Meter {
         spans::line(frames);
         crate::shadow::back_line(frames);
         submit_split_line(frames);
+        sender::line(frames);
         fresh_open_line(frames);
+        low_ram_line();
         crate::heap_marks::line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
@@ -10275,7 +10449,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, chain_flags(p.tearing))
+                    .ResizeBuffers(BUFFERS, width, height, format, p.flags)
             };
             match resized {
                 Ok(()) => {
@@ -10311,6 +10485,10 @@ impl Host {
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
+            // VICTORY_FRAME_LATENCY: room for this frame in the screen's queue first.
+            if let Some(waitable) = &p.waitable {
+                waitable.wait();
+            }
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
@@ -10503,6 +10681,10 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // The swap chain shows what the queue was given: the copy to the
+            // back buffer, and the frame's submissions, are on it first
+            // (`sender`).
+            sender::drain();
             // Frame generation: the frame's markers, constants and tags.
             let presenting = crate::streamline::present_begins(
                 frame,
@@ -10586,6 +10768,18 @@ impl Host {
                     .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
                     .and_then(|s| s.cast::<IDXGISwapChain3>())
             });
+            // VICTORY_FRAME_LATENCY: the swap chain made here without frame generation gets
+            // the frame latency waitable object.
+            let latency = frame_latency();
+            let mut flags = chain_flags(tearing);
+            let plain_desc = match latency {
+                Some(_) if fsr.is_none() && !matches!(proxied, Some(Ok(_))) => {
+                    flags = DXGI_SWAP_CHAIN_FLAG(flags.0 | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0);
+                    DXGI_SWAP_CHAIN_DESC1 { Flags: flags.0 as u32, ..desc }
+                }
+                _ => desc,
+            };
+            let desc = plain_desc;
             let swap_chain = if let Some(swap_chain) = fsr { swap_chain } else { match proxied {
                 Some(Ok(swap_chain)) => {
                     crate::streamline::swap_chain_made(true, None);
@@ -10607,6 +10801,30 @@ impl Host {
                     factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
                 ),
             } };
+            let waitable = if flags.0 & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 != 0 {
+                let latency = latency.unwrap_or(1);
+                let set = swap_chain.SetMaximumFrameLatency(latency);
+                let handle = swap_chain.GetFrameLatencyWaitableObject();
+                if set.is_err() || handle.is_invalid() {
+                    tracing::warn!(
+                        latency,
+                        set = ?set.err(),
+                        "VICTORY_FRAME_LATENCY: the swap chain's frame latency was not set or has no waitable object; presents do not wait on it"
+                    );
+                    if !handle.is_invalid() {
+                        drop(Waitable(handle));
+                    }
+                    None
+                } else {
+                    tracing::info!(latency, "swap chain: at most {latency} frames queued for the screen; each present waits for room first (VICTORY_FRAME_LATENCY)");
+                    Some(Waitable(handle))
+                }
+            } else {
+                if latency.is_some() {
+                    tracing::info!("VICTORY_FRAME_LATENCY: not used with a frame generation swap chain (it paces its own presents)");
+                }
+                None
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -10624,9 +10842,10 @@ impl Host {
                 panel: panel::Panel::new(),
                 notice: panel::Notice::new(),
                 menu: menu::Menu::new(),
-                tearing,
                 presents_tearing: tearing,
                 present_refused: false,
+                flags,
+                waitable,
             })
         }
     }
@@ -10693,6 +10912,21 @@ fn title_window() -> Option<HWND> {
 }
 
 #[cfg(test)]
+mod frame_latency_tests {
+    use super::parse_frame_latency;
+
+    #[test]
+    fn the_switch_takes_one_to_sixteen_and_is_off_otherwise() {
+        assert_eq!(parse_frame_latency("1"), Some(1));
+        assert_eq!(parse_frame_latency(" 2 "), Some(2));
+        assert_eq!(parse_frame_latency("16"), Some(16));
+        for off in ["0", "", "17", "-1", "two", "1.5"] {
+            assert_eq!(parse_frame_latency(off), None, "{off:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod title_window_tests {
     use super::{Candidate, pick_title_window};
 
@@ -10751,6 +10985,15 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// The card's own memory in bytes (`DedicatedVideoMemory`), as the
+    /// driver reports it: a little under the size on the box.
+    pub(crate) fn card_own_memory(&self) -> Option<u64> {
+        let adapter = self.adapter.as_ref()?;
+        // SAFETY: a plain query that fills a structure.
+        let desc = unsafe { adapter.GetDesc1() }.ok()?;
+        Some(desc.DedicatedVideoMemory as u64)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

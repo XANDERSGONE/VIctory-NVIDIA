@@ -538,8 +538,10 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers that lie in the card's memory
-/// and are filled by the CPU through the bus (`VICTORY_WINDOWS_BAR_MB`; 0, the
-/// default, none): one buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`), no CPU's side, no
+/// and are filled by the CPU through the bus (`VICTORY_WINDOWS_BAR_MB`; unset,
+/// [`windows_bar_default_mb`]: scaled to the card on a PC low on RAM,
+/// [`crate::residency::low_ram`] (under 24 GB, or `VICTORY_LOW_RAM`), else
+/// none; 0 turns it off): one buffer (`D3D12_HEAP_TYPE_GPU_UPLOAD`), no CPU's side, no
 /// copy to send and no list of changes, unlike [`window_card_most`]. The CPU
 /// only writes them, as no shader is declared to write a window; if one were,
 /// its snapshot and compare would read through the bus, right but slow. In a
@@ -548,11 +550,48 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 ///
 /// Windows go there while a fifth of the card's budget is free, as with
 /// [`window_room_for`], which this comes before.
-fn window_mapped_most() -> u64 {
+fn window_mapped_most(host: &crate::host::Host) -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        let set = std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let mb = set.unwrap_or_else(|| {
+            let low_ram = crate::residency::low_ram();
+            let vram = host.card_own_memory();
+            let mb = windows_bar_default_mb(low_ram, vram);
+            if mb > 0 {
+                tracing::info!(
+                    ram_gb = crate::residency::total_ram().unwrap_or(0) >> 30,
+                    vram_mb = vram.unwrap_or(0) >> 20,
+                    mb,
+                    "low-RAM defaults on: title memory windows in the card's memory the CPU maps, \
+                     scaled to the card (VICTORY_WINDOWS_BAR_MB sets it by hand, 0 turns it off; \
+                     VICTORY_LOW_RAM=0 turns it off with the other low-RAM defaults)"
+                );
+            }
+            mb
+        });
+        mb << 20
     })
+}
+
+/// [`window_mapped_most`] in MiB when `VICTORY_WINDOWS_BAR_MB` is not set, on
+/// a PC that is or is not `low_ram` ([`crate::residency::low_ram`], the same
+/// check as the layer's other low-RAM defaults, so `VICTORY_LOW_RAM=0` turns
+/// this off with them and `=1` on) with a card of `vram` bytes of its own:
+/// 3072 on a 12 GB card or larger (PR #6), 1024 on an 8 GB card or smaller,
+/// and 512 more for each GB between (2048 on 10 GB), so small cards keep their
+/// memory for textures; a card of unknown size gets 1024. Not low on RAM: 0.
+/// Windows lets a card share at most half the RAM, and the windows filled that
+/// on a 16 GB PC (RTX 3060) about a minute into the world: 0x8007000E, then a
+/// driver fault. 32 GB and more never got there. The windows only go there
+/// while the card is under 80 % of its budget either way ([`window_mapped_for`]).
+fn windows_bar_default_mb(low_ram: bool, vram: Option<u64>) -> u64 {
+    if !low_ram {
+        return 0;
+    }
+    // The card's size in whole GB, rounded (a 12 GB card reports a little under 12 GiB).
+    let Some(gb) = vram.filter(|&v| v > 0).map(|v| (v + (512 << 20)) >> 30) else { return 1024 };
+    1024 + (gb.clamp(8, 12) - 8) * 512
 }
 
 /// Bytes alive of windows in card memory the CPU maps.
@@ -561,11 +600,11 @@ static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-    let most = window_mapped_most();
+    let host = host()?;
+    let most = window_mapped_most(host);
     if most == 0 {
         return None;
     }
-    let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
@@ -1705,7 +1744,7 @@ fn workers() -> &'static Workers {
                                 std::hint::spin_loop();
                             }
                             turns = turns.wrapping_add(1);
-                            if turns % 16 == 0 {
+                            if turns.is_multiple_of(16) {
                                 std::thread::yield_now();
                             }
                         }
@@ -2774,6 +2813,7 @@ mod merge_tests {
     /// changes a mapping; a page that stays away loses it, and nothing else.
     #[test]
     fn a_put_waits_for_a_change_of_mapping() {
+        let _serial = crate::watch::mapping_test_lock();
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
         };
@@ -6141,4 +6181,33 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod windows_bar_tests {
+    use super::windows_bar_default_mb;
+
+    #[test]
+    fn on_a_pc_low_on_ram_the_mapped_windows_scale_with_the_card() {
+        const GB: u64 = 1 << 30;
+        const MB: u64 = 1 << 20;
+        // 12 GB and up: 3 GB, as a 12 GB card reports itself (12,010 MB) too
+        assert_eq!(windows_bar_default_mb(true, Some(12_010 * MB)), 3072);
+        assert_eq!(windows_bar_default_mb(true, Some(16 * GB)), 3072);
+        assert_eq!(windows_bar_default_mb(true, Some(24 * GB)), 3072);
+        // between: 512 MB more for each GB over 8
+        assert_eq!(windows_bar_default_mb(true, Some(10 * GB)), 2048);
+        assert_eq!(windows_bar_default_mb(true, Some(11 * GB)), 2560);
+        // 8 GB and under: 1 GB
+        assert_eq!(windows_bar_default_mb(true, Some(8 * GB)), 1024);
+        assert_eq!(windows_bar_default_mb(true, Some(6 * GB)), 1024);
+        assert_eq!(windows_bar_default_mb(true, Some(4 * GB)), 1024);
+        // a card of unknown size: 1 GB
+        assert_eq!(windows_bar_default_mb(true, None), 1024);
+        assert_eq!(windows_bar_default_mb(true, Some(0)), 1024);
+        // not low on RAM (24 GB and up, RAM that can't be read, or VICTORY_LOW_RAM=0): none
+        assert_eq!(windows_bar_default_mb(false, Some(12 * GB)), 0);
+        assert_eq!(windows_bar_default_mb(false, Some(8 * GB)), 0);
+        assert_eq!(windows_bar_default_mb(false, None), 0);
+    }
 }

@@ -35,21 +35,59 @@ const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
+/// The same on PCs low on RAM ([`crate::residency::low_ram`]): 128 MiB.
+const STAGING_KEPT_LOW: usize = 2;
+/// How many empty staging blocks are kept at most: `VICTORY_STAGING_KEEP`
+/// (0 to [`STAGING_KEPT`]), else [`STAGING_KEPT_LOW`] on PCs low on RAM and
+/// [`STAGING_KEPT`] on others. Each one is 64 MiB of the PC's memory.
+pub(crate) fn staging_kept() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_KEEP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.min(STAGING_KEPT))
+            .unwrap_or(if crate::residency::low_ram() { STAGING_KEPT_LOW } else { STAGING_KEPT })
+    })
+}
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
+/// The same for blocks of textures ([`spares_for`]).
+static TEXTURE_SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
 /// Sets how many empty blocks stay, by the card's memory (budget and use):
 /// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
+    if let Some([budget, ..]) = memory
+        && BUDGET.swap(budget, Ordering::Relaxed) == 0
+    {
+        // Once, for the testers' logs: which of this build's VRAM trims run.
+        let on = |name| if trim_on(name) { "on" } else { "off" };
+        tracing::info!(
+            "VRAM trims: pool packing {}, pool draining {} ({} MiB of holes taken as room), spare blocks by budget {}, \
+             targets reserve by budget {}, small-card line {}, texture floor check {}",
+            on("VICTORY_POOL_PACK"),
+            on("VICTORY_POOL_DRAIN"),
+            drain_allowance().map_or(0, |b| b >> 20),
+            on("VICTORY_POOL_SPARE_SCALE"),
+            on("VICTORY_TARGETS_ROOM_SCALE"),
+            on("VICTORY_SMALL_CARD_LINE"),
+            on("VICTORY_TEXTURE_FLOOR_CHECK"),
+        );
+    }
     let pressure = crate::residency::pressured();
     let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    // Of blocks of textures, a number that follows the card's budget
+    // ([`spares_for`]); the staging blocks (the PC's memory) keep theirs.
+    let textures_limit = spares_for(limit, memory.map(|[budget, ..]| budget), spare_scale());
     SPARES.store(limit, Ordering::Relaxed);
+    TEXTURE_SPARES.store(textures_limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
     // A busy allocator observes the new limit on its next allocation or tick.
     if let Ok(mut pool) = TEXTURES.try_lock() {
-        pool.reclaim(tick, limit, true);
+        pool.reclaim(tick, textures_limit, true);
     }
     if let Ok(mut pool) = STAGING.try_lock() {
         let staging_limit = if crate::residency::critical_commit() {
@@ -73,6 +111,43 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
         Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
         _ => SPARE,
+    }
+}
+
+/// The card's budget as last read ([`room`], once a second; 0 before).
+static BUDGET: AtomicU64 = AtomicU64::new(0);
+
+/// The card's budget for this process as last read, if one was.
+pub(crate) fn budget() -> Option<u64> {
+    Some(BUDGET.load(Ordering::Relaxed)).filter(|&b| b > 0)
+}
+
+/// Whether a VRAM trim of this build is on: `VICTORY_VRAM_TRIM=0` turns
+/// all of them off at once, `name=0` that one. (Read once by each caller.)
+pub(crate) fn trim_on(name: &str) -> bool {
+    let off = |v: Option<std::ffi::OsString>| v.is_some_and(|v| v == "0");
+    !off(std::env::var_os("VICTORY_VRAM_TRIM")) && !off(std::env::var_os(name))
+}
+
+/// Whether the empty blocks of textures kept while the card has room follow
+/// its budget (`VICTORY_POOL_SPARE_SCALE`, on; 0: [`SPARE_KEPT`], 4 GiB of
+/// them on any card, as before).
+fn spare_scale() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| trim_on("VICTORY_POOL_SPARE_SCALE"))
+}
+
+/// Empty blocks of textures kept, of `limit` ([`spares`]): with `scale`,
+/// [`SPARE_KEPT`] is no more than a sixteenth of the budget (about 450 MB of
+/// a 7 GB budget, 700 MB of 11 GB), never under [`SPARE`]. Empty blocks are
+/// the card's memory in use though no texture holds them; 64 of them stayed
+/// while the card was under 85 % of its budget, whatever its size, and
+/// render targets and frame generation, which are made with no room test,
+/// found that much less.
+fn spares_for(limit: usize, budget: Option<u64>, scale: bool) -> usize {
+    match budget {
+        Some(budget) if scale && limit > SPARE => limit.min(((budget / 16) / BLOCK) as usize).max(SPARE),
+        _ => limit,
     }
 }
 
@@ -122,7 +197,7 @@ impl Ripe {
     fn now() -> Ripe {
         let (started, finished) = crate::host::submissions();
         // Not more than are kept ([`room`]): they would go and be made again.
-        Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)) }
+        Ripe { started, finished, ahead: ahead().min(TEXTURE_SPARES.load(Ordering::Relaxed)) }
     }
 
     fn is<B>(self, block: &Block<B>) -> bool {
@@ -194,6 +269,8 @@ struct Block<B> {
     /// When that was (ms).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     since: u64,
+    /// Bytes of its pieces taken and not given back.
+    held: u64,
 }
 
 struct Pool<B> {
@@ -204,28 +281,36 @@ struct Pool<B> {
     /// The empty blocks it was last told to keep, and the most it keeps.
     spare: usize,
     most: usize,
+    /// Where the number of empty blocks to keep now is ([`room`]).
+    kept: &'static AtomicUsize,
     retry_growth_at: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, retry_growth_at: 0 }
+        Pool::with(most, &SPARES)
+    }
+
+    const fn with(most: usize, kept: &'static AtomicUsize) -> Pool<B> {
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, kept, retry_growth_at: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
     /// part was ever used before; `make` makes a block when none has room.
     fn take(&mut self, len: u64, align: u64, now: u64, make: impl FnMut() -> Option<B>) -> Option<(Piece, B, bool)> {
-        self.take_ripe(len, align, now, Ripe::ALL, make)
+        self.take_ripe(len, align, now, Ripe::ALL, false, make)
     }
 
     /// The same from a block that is ripe, if one has room; `make` makes one
-    /// ahead too, when few are empty.
+    /// ahead too, when few are empty. With `pack`, from the ripe block that
+    /// holds the most of those with room ([`pack`]), not the first.
     fn take_ripe(
         &mut self,
         len: u64,
         align: u64,
         now: u64,
         ripe: Ripe,
+        pack: bool,
         mut make: impl FnMut() -> Option<B>,
     ) -> Option<(Piece, B, bool)> {
         // With blocks made ahead, what would be an allocation of its own (and
@@ -235,13 +320,29 @@ impl<B: Clone> Pool<B> {
         }
         self.rested(now);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
+        if pack {
+            // The fullest first; an empty block last of all, so that empty
+            // ones stay empty (and go) while others have room.
+            let mut by_held: Vec<(u64, usize)> = self
+                .blocks
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let b = b.as_ref()?;
+                    (ripe.is(b) && b.held + len <= BLOCK).then_some((if b.free.whole(BLOCK) { 0 } else { b.held + 1 }, i))
+                })
+                .collect();
+            by_held.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            found = by_held.into_iter().find_map(|(_, i)| Some((i, self.blocks[i].as_mut()?.free.take(len, align)?)));
+        } else {
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                if let Some(block) = block
+                    && ripe.is(block)
+                    && let Some(start) = block.free.take(len, align)
+                {
+                    found = Some((i, start));
+                    break;
+                }
             }
         }
         if found.is_none() && ripe.ahead > 0 {
@@ -278,6 +379,7 @@ impl<B: Clone> Pool<B> {
         let block = self.blocks[i].as_mut()?;
         let again = start < block.used_to;
         block.used_to = block.used_to.max(start + len);
+        block.held += len;
         Some((Piece { block: i, start, len }, block.memory.clone(), again))
     }
 
@@ -300,18 +402,30 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] =
+            Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms(), held: 0 });
         i
     }
 
     fn give(&mut self, piece: Piece, now: u64) {
+        if let Some(Some(block)) = self.blocks.get_mut(piece.block) {
+            block.held = block.held.saturating_sub(piece.len);
+        }
         self.resting.push_back((now + REST, piece));
+    }
+
+    /// Bytes of the empty blocks, and of the holes of the others: what
+    /// no piece taken holds in them (resting pieces too).
+    fn slack(&self) -> (u64, u64) {
+        self.blocks.iter().flatten().fold((0, 0), |(empty, holes), b| {
+            if b.free.whole(BLOCK) { (empty + BLOCK, holes) } else { (empty, holes + BLOCK.saturating_sub(b.held)) }
+        })
     }
 
     /// Makes the pieces that rested long enough free, and lets go of empty
     /// blocks past [`SPARE`].
     fn rested(&mut self, now: u64) {
-        self.reclaim(now, SPARES.load(Ordering::Relaxed), false);
+        self.reclaim(now, self.kept.load(Ordering::Relaxed), false);
     }
 
     fn reclaim(&mut self, now: u64, limit: usize, sweep: bool) {
@@ -391,7 +505,7 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::with(SPARE_KEPT, &TEXTURE_SPARES));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
@@ -405,6 +519,78 @@ static HELD: AtomicU64 = AtomicU64::new(0);
 /// by us that new textures take first.
 pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
+}
+
+/// Whether a texture goes in the fullest block with room for it, not the
+/// first (`VICTORY_POOL_PACK`, on; 0: the first, as before). First fit
+/// spread pieces over every block, and a block goes only when wholly
+/// empty: 1.2 to 1.7 GB of holes were the card's memory in use with no
+/// texture in it (issue #196). Packed, new pieces fill the full blocks and
+/// the sparse ones empty and go.
+fn pack() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| trim_on("VICTORY_POOL_PACK"))
+}
+
+/// Of the holes in blocks of textures, the bytes taken as room when the
+/// card nears its line (`VICTORY_POOL_DRAIN_MB`, 512); `None`: all of them,
+/// as before (`VICTORY_POOL_DRAIN=0`).
+fn drain_allowance() -> Option<u64> {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        trim_on("VICTORY_POOL_DRAIN").then(|| {
+            std::env::var("VICTORY_POOL_DRAIN_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(512u64) << 20
+        })
+    })
+}
+
+/// [`texture_room`] as the look for idle textures takes it
+/// (`resource::let_go_idle`): empty blocks, and holes up to
+/// [`drain_allowance`]. Holes past it are counted in use, as the system
+/// counts them, so that idle textures go when they make the card near its
+/// line, the sparsest blocks' first ([`blocks_held`]), and those blocks
+/// empty and go.
+pub(crate) fn texture_room_counted() -> u64 {
+    let Some(allowance) = drain_allowance() else {
+        return texture_room();
+    };
+    let (empty, holes) = lock(&TEXTURES).slack();
+    let counted = empty + holes.min(allowance);
+    // For the log: how much was no longer counted, at each new high.
+    static SAID: AtomicU64 = AtomicU64::new(0);
+    let over = holes.saturating_sub(allowance) >> 20;
+    if over >= SAID.load(Ordering::Relaxed) + 256 {
+        SAID.store(over, Ordering::Relaxed);
+        tracing::info!("holes in texture blocks: {} MiB, {over} MiB of them counted in use", holes >> 20);
+    }
+    counted
+}
+
+/// Bytes each block of textures holds, by its number (`u64::MAX`: none).
+pub(crate) fn blocks_held() -> Vec<u64> {
+    lock(&TEXTURES).blocks.iter().map(|b| b.as_ref().map_or(u64::MAX, |b| b.held)).collect()
+}
+
+/// The number of the block `texture` lies in, if it is a texture of the
+/// pool ([`texture`]).
+pub(crate) fn block_of(texture: &ID3D12Resource) -> Option<usize> {
+    let mut raw: *mut c_void = std::ptr::null_mut();
+    let mut size = std::mem::size_of::<*mut c_void>() as u32;
+    // SAFETY: the interface `give_back_with` set, given with a reference
+    // of its own, which `object` releases (the texture keeps one: it
+    // never goes to zero here).
+    unsafe {
+        texture.GetPrivateData(&RECLAIM_KEY, &mut size, Some((&raw mut raw).cast())).ok()?;
+        if raw.is_null() || size as usize != std::mem::size_of::<*mut c_void>() {
+            return None;
+        }
+        let object = IUnknown::from_raw(raw);
+        // Ours only: a `Reclaim` (its methods are [`RECLAIM`]).
+        let reclaim = object.as_raw().cast::<Reclaim>();
+        let block = std::ptr::eq((*reclaim).methods, &RECLAIM.0).then(|| (*reclaim).piece.block);
+        drop(object);
+        block
+    }
 }
 
 /// For the memory line: blocks of textures and of staging buffers, in MiB.
@@ -527,7 +713,10 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut pool = lock(&STAGING);
+    // At most [`staging_kept`] empty blocks stay, whatever the card's room.
+    pool.most = staging_kept();
+    let taken = pool.take(bytes, 512, now(), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -538,7 +727,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    })?;
+    });
+    drop(pool);
+    let (piece, memory, again) = taken?;
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -766,15 +957,17 @@ pub(crate) fn begun_before(texture: &ID3D12Resource) -> Option<u64> {
     unseen.get(&raw).copied().filter(|&begun| begun > finished)
 }
 
+/// The private data a texture of the pool holds its [`Reclaim`] under.
+const RECLAIM_KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
+
 /// Makes `texture` give `piece` back when the last reference to it goes.
 fn give_back_with(texture: &ID3D12Resource, piece: Piece, small: u64) {
-    const KEY: GUID = GUID::from_u128(0x6f0e2f0c_5a59_4b1e_9a3f_7f4d2c9be713);
     let made = Box::into_raw(Box::new(Reclaim { methods: &RECLAIM.0, references: AtomicU32::new(1), piece, small }));
     // SAFETY: a COM object of ours with one reference, which this takes and
     // drops at the end; the texture takes its own.
     unsafe {
         let object = IUnknown::from_raw(made.cast());
-        if texture.SetPrivateDataInterface(&KEY, &object).is_err() {
+        if texture.SetPrivateDataInterface(&RECLAIM_KEY, &object).is_err() {
             // Never given back: the piece stays taken, nothing is reused
             // under a texture that may be alive.
             std::mem::forget(object);
@@ -823,7 +1016,7 @@ pub(crate) unsafe fn texture(
         0
     };
     #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
-    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), || {
+    let (piece, heap, again) = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), Ripe::now(), pack(), || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
             Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -934,6 +1127,69 @@ mod tests {
     }
 
     #[test]
+    fn empty_blocks_kept_follow_the_budget() {
+        const GIB: u64 = 1 << 30;
+        // A 7 GB budget (8 GB card): 7 blocks, 448 MiB; 11 GB: 11.
+        assert_eq!(spares_for(SPARE_KEPT, Some(7 * GIB), true), 7);
+        assert_eq!(spares_for(SPARE_KEPT, Some(11 * GIB), true), 11);
+        assert_eq!(spares_for(SPARE_KEPT, Some(GIB), true), SPARE);
+        assert_eq!(spares_for(SPARE_KEPT, Some(64 * GIB), true), SPARE_KEPT);
+        assert_eq!(spares_for(SPARE, Some(11 * GIB), true), SPARE);
+        assert_eq!(spares_for(SPARE_KEPT, Some(7 * GIB), false), SPARE_KEPT);
+        assert_eq!(spares_for(SPARE_KEPT, None, true), SPARE_KEPT);
+    }
+
+    #[test]
+    fn packed_pieces_go_in_the_fullest_block() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut n = 0;
+        let mut make = || {
+            n += 1;
+            Some(n)
+        };
+        // Block 0 full, block 1 half full.
+        let a = pool.take_ripe(BLOCK / 2, 65536, 0, Ripe::ALL, true, &mut make).unwrap().0;
+        let b = pool.take_ripe(BLOCK / 2, 65536, 0, Ripe::ALL, true, &mut make).unwrap().0;
+        assert_eq!(a.block, b.block);
+        let c = pool.take_ripe(BLOCK / 4, 65536, 0, Ripe::ALL, true, &mut make).unwrap().0;
+        let d = pool.take_ripe(BLOCK / 4, 65536, 0, Ripe::ALL, true, &mut make).unwrap().0;
+        assert_ne!(c.block, a.block);
+        assert_eq!(d.block, c.block);
+        pool.give(a, 0);
+        pool.rested(REST);
+        // Block 0 holds half, block 1 half: the lower number on a tie.
+        let e = pool.take_ripe(BLOCK / 8, 65536, REST, Ripe::ALL, true, &mut make).unwrap().0;
+        assert_eq!(e.block, b.block);
+        // Now block 0 holds more: there again, not in block 1's room.
+        let f = pool.take_ripe(BLOCK / 8, 65536, REST, Ripe::ALL, true, &mut make).unwrap().0;
+        assert_eq!(f.block, b.block);
+        assert_eq!(pool.blocks[b.block].as_ref().unwrap().held, BLOCK / 2 + BLOCK / 4);
+        let (empty, holes) = pool.slack();
+        assert_eq!((empty, holes), (0, BLOCK / 4 + BLOCK / 2));
+    }
+
+    #[test]
+    fn packing_leaves_empty_blocks_empty() {
+        let mut pool: Pool<u32> = Pool::new(SPARE_KEPT);
+        let mut n = 0;
+        let mut make = || {
+            n += 1;
+            Some(n)
+        };
+        let a = pool.take_ripe(BLOCK / 2, 65536, 0, Ripe::ALL, true, &mut make).unwrap().0;
+        let b = pool.take_ripe(BLOCK / 2, 65536, 0, Ripe::ALL, true, &mut make).unwrap().0;
+        let c = pool.take_ripe(BLOCK / 2, 65536, 0, Ripe::ALL, true, &mut make).unwrap().0;
+        assert_ne!(c.block, a.block);
+        pool.give(c, 0);
+        pool.give(b, 0);
+        pool.rested(REST);
+        assert_eq!(pool.slack(), (BLOCK, BLOCK / 2));
+        // Into block 0's half, not the empty block.
+        let d = pool.take_ripe(BLOCK / 4, 65536, REST, Ripe::ALL, true, &mut make).unwrap().0;
+        assert_eq!(d.block, a.block);
+    }
+
+    #[test]
     fn a_failed_block_is_not_retried_for_each_small_upload() {
         let mut pool: Pool<u32> = Pool::new(2);
         let calls = std::cell::Cell::new(0);
@@ -1012,7 +1268,7 @@ mod tests {
             Some(made.get())
         };
         let at = |started, finished| Ripe { started, finished, ahead: 2 };
-        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, make).unwrap().1;
+        let take = |pool: &mut Pool<u64>, ripe| pool.take_ripe(BLOCK / 2, 65536, 0, ripe, false, make).unwrap().1;
         // Nothing runs: at once, and two are made ahead, one a time.
         assert_eq!(take(&mut pool, at(0, 0)), 1);
         assert_eq!(made.get(), 2);
@@ -1028,7 +1284,7 @@ mod tests {
         assert_eq!(take(&mut pool, at(7, 4)), 4);
         assert_eq!(take(&mut pool, at(7, 5)), 4);
         // A whole block's worth too.
-        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), make).unwrap().1, 5);
+        assert_eq!(pool.take_ripe(BLOCK, 65536, 0, at(8, 7), false, make).unwrap().1, 5);
         // Off: the first with room, whatever its age, none ahead.
         let n = made.get();
         assert_eq!(pool.take(BLOCK / 2, 65536, 0, make).unwrap().1, 6);

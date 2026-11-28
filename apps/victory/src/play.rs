@@ -888,6 +888,20 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
     {
         s.insert("VICTORY_MFG_UNLOCKER_DLL".to_owned(), dll.to_string_lossy().into_owned());
     }
+    // The card memory held back for frame generation (VICTORY_TEXTURE_ROOM_PERCENT 80 or 86,
+    // about 0.5 to 1 GB of a 12 GB card) is given back to textures where none can run: DLSS
+    // frame generation asked of a card without it and no MFG Unlocker, and FSR 3 not asked,
+    // its files not found, or DLSS upscaling off (FSR 3 needs it on either console). A value the
+    // menu or --set gave stays.
+    let room_set = menu.iter().any(|(k, _)| k == "VICTORY_TEXTURE_ROOM_PERCENT")
+        || o.more.iter().filter_map(|m| m.split_once('=')).any(|(k, _)| k.trim() == "VICTORY_TEXTURE_ROOM_PERCENT");
+    if !room_set && s.contains_key("VICTORY_TEXTURE_ROOM_PERCENT") {
+        let card = victory_hle::streamline::adapter_name().unwrap_or_default();
+        if !framegen_can_run(&s, &card, !mods.is_empty()) {
+            s.remove("VICTORY_TEXTURE_ROOM_PERCENT");
+            println!("No frame generation can run here: its card memory is left to textures.");
+        }
+    }
     // The first start of this victory.exe (no mark for its bytes yet): the game plays a little
     // and starts again by itself (crates\victory-gpu\src\host\menu.rs, `warmup`), since a new
     // exe's first run stays at about 14 fps. `--set VICTORY_WARMUP_RESTART=0`: not done.
@@ -934,7 +948,59 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
             std::env::set_var(k, v);
         }
     }
+    keep_ram();
     Ok(Ready { exe, series_s })
+}
+
+/// Whether any frame generation the settings `s` ask for can run on the card named `card`:
+/// DLSS frame generation on an RTX 40 or 50, or on another card with MFG Unlocker on or a
+/// mod DLL beside this program (`mods`); FSR 3 with AMD's files found and DLSS upscaling on
+/// (on either console it needs it). The layer decides at the start; this is only for what the
+/// launcher holds back for it. An unknown card counts as able.
+fn framegen_can_run(s: &BTreeMap<String, String>, card: &str, mods: bool) -> bool {
+    let on = |k: &str| s.get(k).is_some_and(|v| v == "1");
+    let dlss_fg = on("VICTORY_FRAMEGEN")
+        && (card.is_empty() || victory_hle::streamline::dlss_framegen_card(card) || on("VICTORY_MFG_UNLOCKER") || mods);
+    let fsr_fg = on("VICTORY_FSR_FRAMEGEN")
+        && s.contains_key("VICTORY_FIDELITYFX_DIR")
+        && on("VICTORY_DLSS");
+    dlss_fg || fsr_fg
+}
+
+/// `VICTORY_KEEP_RAM_GB=<n>` (unset: nothing): a hard minimum of `n` GB for
+/// this process's working set, so that Windows does not trim the game's
+/// memory out to the page file under pressure. On a 32 GB PC the game
+/// commits about 28 GB; when the PC ran low, Windows cut its working set
+/// from 15 GB to 2 GB at once and the game ran at half speed for minutes
+/// while it read its memory back from disk. Other programs are paged out
+/// instead. Too large a number for the PC, and Windows refuses it (logged).
+fn keep_ram() {
+    let Some(gb) = std::env::var("VICTORY_KEEP_RAM_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|gb| *gb > 0)
+    else {
+        return;
+    };
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn SetProcessWorkingSetSizeEx(process: isize, min: usize, max: usize, flags: u32) -> i32;
+        fn GetLastError() -> u32;
+    }
+    // QUOTA_LIMITS_HARDWS_MIN_ENABLE: the minimum is kept even under
+    // pressure; QUOTA_LIMITS_HARDWS_MAX_DISABLE: the maximum is only a hint.
+    const FLAGS: u32 = 0x1 | 0x8;
+    let min = gb << 30;
+    // SAFETY: our own process's pseudo handle and plain sizes.
+    let (ok, error) = unsafe {
+        let ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), min, min.saturating_mul(2), FLAGS) != 0;
+        (ok, if ok { 0 } else { GetLastError() })
+    };
+    if ok {
+        println!("Memory: at least {gb} GB of the game's memory is kept in RAM (VICTORY_KEEP_RAM_GB).");
+    } else {
+        println!("Memory: Windows refused to keep {gb} GB in RAM (error {error}); running without it.");
+    }
 }
 
 /// A PowerShell word holding `text` as it is.
@@ -994,6 +1060,30 @@ mod tests {
             more: Vec::new(),
             preload: false,
         }
+    }
+
+    #[test]
+    fn frame_generation_that_cannot_run_is_told_apart() {
+        let with = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+        };
+        let dlss_fg = with(&[("VICTORY_DLSS", "1"), ("VICTORY_FRAMEGEN", "1")]);
+        assert!(framegen_can_run(&dlss_fg, "NVIDIA GeForce RTX 5070", false));
+        assert!(!framegen_can_run(&dlss_fg, "NVIDIA GeForce RTX 3080", false));
+        assert!(framegen_can_run(&dlss_fg, "NVIDIA GeForce RTX 3080", true));
+        assert!(framegen_can_run(&dlss_fg, "", false));
+        let mut unlocked = dlss_fg.clone();
+        unlocked.insert("VICTORY_MFG_UNLOCKER".to_owned(), "1".to_owned());
+        assert!(framegen_can_run(&unlocked, "NVIDIA GeForce RTX 3080", false));
+        // FSR 3: its files found and DLSS upscaling on
+        let fsr_no_files = with(&[("VICTORY_DLSS", "1"), ("VICTORY_FSR_FRAMEGEN", "1")]);
+        assert!(!framegen_can_run(&fsr_no_files, "NVIDIA GeForce RTX 3080", false));
+        let fsr = with(&[("VICTORY_DLSS", "1"), ("VICTORY_FSR_FRAMEGEN", "1"), ("VICTORY_FIDELITYFX_DIR", "x")]);
+        assert!(framegen_can_run(&fsr, "NVIDIA GeForce RTX 3080", false));
+        // without DLSS upscaling, on either console
+        let fsr_no_dlss = with(&[("VICTORY_FSR_FRAMEGEN", "1"), ("VICTORY_FIDELITYFX_DIR", "x")]);
+        assert!(!framegen_can_run(&fsr_no_dlss, "NVIDIA GeForce RTX 3080", false));
+        assert!(!framegen_can_run(&with(&[]), "NVIDIA GeForce RTX 5070", false));
     }
 
     #[test]

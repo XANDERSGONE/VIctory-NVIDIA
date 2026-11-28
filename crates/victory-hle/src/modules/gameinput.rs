@@ -726,6 +726,19 @@ extern "system" fn current_reading(
     device: *const Device,
     out: Out,
 ) -> HRESULT {
+    // `VICTORY_REFLEX`: the title is about to take a pad or keyboard
+    // reading. A reading that opens a simulation is where Reflex sleeps and
+    // that simulation starts with its input sample, so this comes before
+    // the reading is picked (afterwards a sleep could not make it fresher)
+    // and before our lock is taken (our poll thread must not wait for the
+    // sleep). Here, where the title asks, not where our poll thread reads
+    // the host; whether a reading is then found does not matter, the title
+    // sampled its input either way. A call with nowhere to put a reading
+    // is not one. Nothing without the switch.
+    #[cfg(windows)]
+    if !out.is_null() {
+        victory_gpu::streamline::input_sampling();
+    }
     let hub = hub(this);
     let state = hub.state();
     let newest = |i: usize| {
@@ -1369,7 +1382,7 @@ mod host {
                 .map(|(i, vk)| KeyState {
                     // A scripted letter is the stand-in pad's key of that
                     // name, where a US layout has it (`pad_key`).
-                    scan_code: Some(vk).filter(|_| i < scripted_keys).and_then(super::letter_position).unwrap_or_else(|| {
+                    scan_code: (i < scripted_keys).then_some(vk).and_then(super::letter_position).unwrap_or_else(|| {
                         // SAFETY: plain query.
                         unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) }
                     }),

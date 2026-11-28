@@ -137,7 +137,8 @@ pub use inplace::{title_memory_freeing, title_memory_section, title_memory_secti
 pub use shadow::title_memory_write_combined;
 #[cfg(windows)]
 pub use watch::{
-    SoftViews, kernel_writing, soft_view_guards, title_memory_allocated, title_memory_freed, title_memory_made_real,
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
+    SoftViews, kernel_writing, mapping_ranges, soft_view_guards, title_memory_allocated, title_memory_freed, title_memory_made_real,
+    title_memory_reading, title_memory_reading_range, title_memory_remapped, title_memory_remapping,
+    title_memory_remapping_where, title_memory_splitting, title_memory_unmapping,
     title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };

@@ -169,6 +169,7 @@ mod tests {
             *submitted += 1;
             // SAFETY: closed lists; the fence and event are the host's, under
             // its lock.
+            super::sender::drain();
             unsafe {
                 host.queue.ExecuteCommandLists(&[Some(ahead), Some(behind)]);
                 host.queue.Signal(&host.fence, *submitted).unwrap();
