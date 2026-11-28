@@ -9731,13 +9731,91 @@ struct Presenter {
     notice: panel::Notice,
     /// The F1 settings menu.
     menu: menu::Menu,
-    /// The swap chain lets a frame be shown at once ([`tearing`]): its flags, kept for
-    /// ResizeBuffers, which may not change them.
-    tearing: bool,
     /// Presents ask for that; off for the rest of the run once one such present is refused.
     presents_tearing: bool,
     /// A refused present was logged.
     present_refused: bool,
+    /// The flags the swap chain was made with: whether it lets a frame be shown at once
+    /// ([`tearing`], [`chain_flags`]) and has a frame latency waitable object
+    /// ([`frame_latency`]). Kept for ResizeBuffers, which may not change them.
+    flags: DXGI_SWAP_CHAIN_FLAG,
+    /// The swap chain's frame latency waitable object ([`frame_latency`]): waited on before
+    /// each frame takes a back buffer.
+    waitable: Option<Waitable>,
+}
+
+/// `VICTORY_FRAME_LATENCY=<1 to 16>`: the swap chain is made with a frame latency waitable
+/// object (`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`), at most that many frames
+/// queued for the screen (`SetMaximumFrameLatency`), and each present waits on the object
+/// before it takes a back buffer, rather than DXGI blocking somewhere inside Present. Unset or
+/// 0: off, as before (DXGI's own latency of 3). Only for the swap chain made without frame
+/// generation: FSR 3's and Streamline's frame generation swap chains pace their own presents.
+/// Why: with frame generation off, presents locked to exactly 66.7 ms (15 fps) while a frame
+/// was about 30 ms of work (upstream #175, #515); a queue of presents blocking at a refresh
+/// is one way frames round up to whole refreshes.
+fn frame_latency() -> Option<u32> {
+    static AT: OnceLock<Option<u32>> = OnceLock::new();
+    *AT.get_or_init(|| {
+        let spec = std::env::var("VICTORY_FRAME_LATENCY").ok()?;
+        let latency = parse_frame_latency(&spec);
+        if latency.is_none() && spec.trim() != "0" && !spec.trim().is_empty() {
+            tracing::warn!(spec, "VICTORY_FRAME_LATENCY: expected 0 (off) or 1 to 16; off");
+        }
+        latency
+    })
+}
+
+/// `"1"` → 1, `"2"` → 2; 0, empty, over 16 or not a number → `None` (off).
+fn parse_frame_latency(spec: &str) -> Option<u32> {
+    spec.trim().parse::<u32>().ok().filter(|n| (1..=16).contains(n))
+}
+
+/// How long a present waits on the waitable object before it takes a back buffer, at most.
+/// Past it the frame goes on all the same (counted as timed out in the log line).
+const LATENCY_WAIT_MS: u32 = 500;
+
+/// For the frame-rate lines: µs waited on the frame latency object, waits, waits timed out.
+static LATENCY_WAITS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// A swap chain's frame latency waitable object: closed when dropped.
+struct Waitable(HANDLE);
+
+impl Waitable {
+    /// Waits until the swap chain has room for another frame (or [`LATENCY_WAIT_MS`]).
+    fn wait(&self) {
+        let _waiting = crate::timeline::span("the swap chain's frame latency wait");
+        let began = std::time::Instant::now();
+        // SAFETY: the swap chain's handle, open while `self` lives.
+        let waited = unsafe { WaitForSingleObject(self.0, LATENCY_WAIT_MS) };
+        LATENCY_WAITS[0].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        LATENCY_WAITS[1].fetch_add(1, Ordering::Relaxed);
+        if waited != WAIT_OBJECT_0 {
+            LATENCY_WAITS[2].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Waitable {
+    fn drop(&mut self) {
+        // SAFETY: ours to close (GetFrameLatencyWaitableObject hands the caller the handle).
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// The frame latency wait's line, with the frame rate's ([`frame_latency`]).
+fn latency_line(frames: f64) {
+    let [us, waits, timeouts] = [0, 1, 2].map(|i| LATENCY_WAITS[i].swap(0, Ordering::Relaxed));
+    if waits == 0 {
+        return;
+    }
+    tracing::info!(
+        "frame latency wait (VICTORY_FRAME_LATENCY={}): {:.2} ms a present waited for a back buffer, {:.2} waits a frame, {timeouts} timed out ({LATENCY_WAIT_MS} ms)",
+        frame_latency().unwrap_or(0),
+        us as f64 / 1000.0 / waits as f64,
+        waits as f64 / frames
+    );
 }
 
 /// Whether the swap chain lets a frame be shown as soon as it is presented, not at the screen's
@@ -9886,6 +9964,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        latency_line(frames);
         crate::queue::behind_line(frames);
         crate::streamline::line(frames);
         card_clock_line(frames, ms);
@@ -10370,7 +10449,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, chain_flags(p.tearing))
+                    .ResizeBuffers(BUFFERS, width, height, format, p.flags)
             };
             match resized {
                 Ok(()) => {
@@ -10406,6 +10485,10 @@ impl Host {
         let state = D3D12_RESOURCE_STATES(state_u32 as i32);
         // SAFETY: our swap chain, list and live source texture(s).
         unsafe {
+            // VICTORY_FRAME_LATENCY: room for this frame in the screen's queue first.
+            if let Some(waitable) = &p.waitable {
+                waitable.wait();
+            }
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
@@ -10685,6 +10768,18 @@ impl Host {
                     .CreateSwapChainForHwnd(&queue, hwnd, &desc, None, None)
                     .and_then(|s| s.cast::<IDXGISwapChain3>())
             });
+            // VICTORY_FRAME_LATENCY: the swap chain made here without frame generation gets
+            // the frame latency waitable object.
+            let latency = frame_latency();
+            let mut flags = chain_flags(tearing);
+            let plain_desc = match latency {
+                Some(_) if fsr.is_none() && !matches!(proxied, Some(Ok(_))) => {
+                    flags = DXGI_SWAP_CHAIN_FLAG(flags.0 | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0);
+                    DXGI_SWAP_CHAIN_DESC1 { Flags: flags.0 as u32, ..desc }
+                }
+                _ => desc,
+            };
+            let desc = plain_desc;
             let swap_chain = if let Some(swap_chain) = fsr { swap_chain } else { match proxied {
                 Some(Ok(swap_chain)) => {
                     crate::streamline::swap_chain_made(true, None);
@@ -10706,6 +10801,30 @@ impl Host {
                     factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?.cast::<IDXGISwapChain3>()?,
                 ),
             } };
+            let waitable = if flags.0 & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 != 0 {
+                let latency = latency.unwrap_or(1);
+                let set = swap_chain.SetMaximumFrameLatency(latency);
+                let handle = swap_chain.GetFrameLatencyWaitableObject();
+                if set.is_err() || handle.is_invalid() {
+                    tracing::warn!(
+                        latency,
+                        set = ?set.err(),
+                        "VICTORY_FRAME_LATENCY: the swap chain's frame latency was not set or has no waitable object; presents do not wait on it"
+                    );
+                    if !handle.is_invalid() {
+                        drop(Waitable(handle));
+                    }
+                    None
+                } else {
+                    tracing::info!(latency, "swap chain: at most {latency} frames queued for the screen; each present waits for room first (VICTORY_FRAME_LATENCY)");
+                    Some(Waitable(handle))
+                }
+            } else {
+                if latency.is_some() {
+                    tracing::info!("VICTORY_FRAME_LATENCY: not used with a frame generation swap chain (it paces its own presents)");
+                }
+                None
+            };
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -10723,9 +10842,10 @@ impl Host {
                 panel: panel::Panel::new(),
                 notice: panel::Notice::new(),
                 menu: menu::Menu::new(),
-                tearing,
                 presents_tearing: tearing,
                 present_refused: false,
+                flags,
+                waitable,
             })
         }
     }
@@ -10789,6 +10909,21 @@ fn title_window() -> Option<HWND> {
         );
     }
     picked.map(|hwnd| HWND(hwnd as *mut _))
+}
+
+#[cfg(test)]
+mod frame_latency_tests {
+    use super::parse_frame_latency;
+
+    #[test]
+    fn the_switch_takes_one_to_sixteen_and_is_off_otherwise() {
+        assert_eq!(parse_frame_latency("1"), Some(1));
+        assert_eq!(parse_frame_latency(" 2 "), Some(2));
+        assert_eq!(parse_frame_latency("16"), Some(16));
+        for off in ["0", "", "17", "-1", "two", "1.5"] {
+            assert_eq!(parse_frame_latency(off), None, "{off:?}");
+        }
+    }
 }
 
 #[cfg(test)]
