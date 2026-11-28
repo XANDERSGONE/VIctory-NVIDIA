@@ -549,27 +549,25 @@ impl Tiled {
             let starts: Vec<u32> = runs.iter().map(|run| run.0).collect();
             let counts: Vec<u32> = runs.iter().map(|run| run.1).collect();
             let began = std::time::Instant::now();
-            // SAFETY: a live reserved texture and a live heap of ours; one
-            // region of `tiles` tiles from the subresource's first tile;
-            // `runs.len()` ranges whose counts add up to `tiles`, in three
-            // arrays of that length that live through the call.
-            unsafe {
-                queue.UpdateTileMappings(
-                    texture,
-                    1,
-                    Some(&raw const at),
-                    Some(&raw const size),
-                    &heap,
-                    runs.len() as u32,
-                    Some(flags.as_ptr()),
-                    Some(starts.as_ptr()),
-                    Some(counts.as_ptr()),
-                    D3D12_TILE_MAPPING_FLAG_NONE,
-                );
+            // One region of `tiles` tiles from the subresource's first tile,
+            // on `runs.len()` ranges whose counts add up to `tiles`. With the
+            // host's sender on, it maps them in their place among the sends
+            // (`crate::host::tiles_in_order`).
+            let mapping = crate::host::Tiles {
+                texture: texture.clone(),
+                at,
+                size,
+                heap: heap.clone(),
+                flags,
+                starts,
+                counts,
+            };
+            if let Some(mapping) = crate::host::tiles_in_order(queue, mapping) {
+                mapping.map(queue);
+                crate::host::tiles_mapped_on(queue);
             }
             STATS[6].fetch_add(1, Ordering::Relaxed);
             STATS[7].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-            crate::host::tiles_mapped_on(queue);
             match level {
                 Some(level) => given.levels[level] = true,
                 None => given.packed = true,

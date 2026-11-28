@@ -4239,6 +4239,16 @@ mod panel;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
+mod sender;
+pub(crate) use sender::Tiles;
+
+/// Tiles of a reserved texture to be mapped on `queue`: on the host's queue
+/// with the sender on (`VICTORY_SEND_THREAD`), given to it, so that they
+/// reach the queue behind what it was given; else given back, to be mapped
+/// at once.
+pub(crate) fn tiles_in_order(queue: &ID3D12CommandQueue, tiles: Tiles) -> Option<Tiles> {
+    sender::tiles(queue, tiles)
+}
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
 mod torn;
@@ -4948,7 +4958,15 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    let list: ID3D12CommandList = list.cast()?;
+                    if flown && sender::on() {
+                        // In its place among the sends, ahead of the
+                        // submission's lists (`sender`).
+                        sender::lists(vec![Some(list)]);
+                    } else {
+                        sender::drain();
+                        self.queue.ExecuteCommandLists(&[Some(list)]);
+                    }
                     Ok(())
                 })()
             };
@@ -5313,7 +5331,12 @@ impl Host {
                 }
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
+                // With the sender on (here when no copy queue could be
+                // made), what it was given is sent first, the order held:
+                // a send numbered under the order may still be in its line.
+                // (No item of the sender's takes the order.)
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+                sender::drain();
                 self.queue.ExecuteCommandLists(&lists);
                 let after = *order;
                 drop(order);
@@ -5608,6 +5631,7 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    sender::drain();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -5787,8 +5811,13 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        if sender::on() {
+            // The sender does it, behind the sending (`sender`).
+            sender::land();
+        } else {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
         AFTER_SEND.fetch_add(after.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 
@@ -6275,15 +6304,24 @@ impl Host {
             lists.push(Some(check));
         }
         split.part(4);
-        stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
-        drop(heaps_synced);
-        if crate::heap_marks::on() {
-            crate::heap_marks::heaps_waited(heaps_began.elapsed().as_nanos() as u64);
-        }
-        // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // With the sender's second level (`VICTORY_SEND_THREAD=2`) a
+        // submission sent ahead leaves both to the sender, which does them
+        // before it gives the lists to the queue; the textures made so far
+        // are taken now (`sender`).
+        let heaps_later = if late && sender::level() > 1 {
+            Some((heaps_synced, crate::descriptor::take_made()))
+        } else {
+            stage.next("submit: waiting for the heaps' records");
+            let heaps_began = std::time::Instant::now();
+            drop(heaps_synced);
+            if crate::heap_marks::on() {
+                crate::heap_marks::heaps_waited(heaps_began.elapsed().as_nanos() as u64);
+            }
+            // The slots that waited for a texture's host copy, before the
+            // lists that may read them run.
+            crate::descriptor::make_waiting();
+            None
+        };
         split.part(15);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
@@ -6307,22 +6345,40 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
+            if sender::on() {
+                // Given to the sender, which gives it to the queue in this
+                // order; the flight is noted in the line below as before.
+                #[cfg(feature = "diagnostics")]
+                let _ = sending;
+                sender::run(sender::Run {
+                    lists,
+                    cuts,
+                    value: *submitted,
+                    heaps: heaps_later,
+                    #[cfg(feature = "diagnostics")]
+                    stamp,
+                    #[cfg(feature = "diagnostics")]
+                    compute: two_queues::title_kind() == Some(two_queues::COMPUTE),
+                });
+                stage.next("submit: noting what is in the air");
+            } else {
+                // SAFETY: closed lists; the fence is ours.
+                let signalled = unsafe {
+                    let mut from = 0;
+                    for to in cuts.into_iter().chain([lists.len()]) {
+                        self.queue.ExecuteCommandLists(&lists[from..to]);
+                        from = to;
+                    }
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                awake::sent(&self.device);
+                #[cfg(feature = "diagnostics")]
+                crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
+                self.card_sent();
+                stage.next("submit: noting what is in the air");
+                if let Err(e) = signalled {
+                    fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
                 }
-                self.queue.Signal(&self.fence, *submitted)
-            };
-            awake::sent(&self.device);
-            #[cfg(feature = "diagnostics")]
-            crate::timeline::sent(sending, *submitted, stamp, two_queues::title_kind() == Some(two_queues::COMPUTE));
-            self.card_sent();
-            stage.next("submit: noting what is in the air");
-            if let Err(e) = signalled {
-                fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
             split.part(5);
             let back = crate::picked::with(declared, &picked.written);
@@ -6361,6 +6417,8 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        // Behind whatever the sender was given (`sender`).
+        sender::drain();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -9836,6 +9894,7 @@ impl Meter {
         spans::line(frames);
         crate::shadow::back_line(frames);
         submit_split_line(frames);
+        sender::line(frames);
         fresh_open_line(frames);
         low_ram_line();
         crate::heap_marks::line(frames);
@@ -10539,6 +10598,10 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // The swap chain shows what the queue was given: the copy to the
+            // back buffer, and the frame's submissions, are on it first
+            // (`sender`).
+            sender::drain();
             // Frame generation: the frame's markers, constants and tags.
             let presenting = crate::streamline::present_begins(
                 frame,
