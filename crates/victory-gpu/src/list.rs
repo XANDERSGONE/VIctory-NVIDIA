@@ -318,7 +318,8 @@ pub(crate) static TRIMMED_LISTS: std::sync::atomic::AtomicU64 = std::sync::atomi
 
 /// After how many seconds an idle list nobody took is destroyed, with its
 /// command allocators: `VICTORY_LIST_POOL_IDLE_S=<seconds>`, or with
-/// `VICTORY_ALLOCATOR_TRIM=1` its time (`crate::host::allocator_trim`);
+/// the allocator trim its time (`crate::host::allocator_trim`: on PCs low on
+/// RAM by default, else `VICTORY_ALLOCATOR_TRIM=1`);
 /// neither: never, as before. The pool is last in, first out, so the
 /// oldest entries are the surplus of a spike.
 #[cfg(windows)]

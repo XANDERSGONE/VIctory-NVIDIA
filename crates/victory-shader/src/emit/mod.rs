@@ -82,6 +82,8 @@
 
 mod bitcode;
 mod container;
+#[cfg(test)]
+mod barrier_trim_tests;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
 #[cfg(all(test, windows))]
@@ -264,6 +266,27 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether the group barriers the translation adds between the two host waves of a console
+/// wave64 program are trimmed where they order nothing (`VICTORY_BARRIER_TRIM=0`: every one
+/// stays, as before):
+/// - a meeting before an LDS access is left out when, since the last barrier the whole group
+///   waits at in that block, the program touched no LDS, or only read it and the access reads
+///   too (reads in any order see the same values);
+/// - lane exchanges in a block every lane runs take two buffers in turn, so the barrier after
+///   an exchange's reads waits until the next exchange (whose own barrier stands for it) or
+///   the block's end.
+///
+/// Off with `VICTORY_GROUP_SYNC=0`, where no barrier waits anyway. Part of the translation:
+/// the shader cache keys on it.
+pub fn barrier_trim() -> bool {
+    #[cfg(test)]
+    if let Some(on) = lower::TEST_BARRIER_TRIM.get() {
+        return on && group_sync() != 0;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_TRIM").is_none_or(|v| v != "0")) && group_sync() != 0
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
