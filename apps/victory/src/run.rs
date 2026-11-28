@@ -213,6 +213,8 @@ pub fn run(
     };
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = victory_loader::load(&prepared, &images)?;
+    // Crash reports name the program as the title ships it, not as our copy.
+    victory_loader::name_image(image.base(), &exe.file_name().unwrap_or_default().to_string_lossy());
     // The program is mapped from the copy `load` wrote: the file's bytes
     // and their patched copy are not read again, and were held for the
     // whole run (two blocks of 114.7 MB each for the title, in
