@@ -1427,6 +1427,39 @@ fn fresh_open_line(frames: f64) {
     }
 }
 
+/// Every 30 seconds of frames (and with the first one): what the layer did
+/// to keep its own memory short ([`allocator_trim`], `crate::list` idle
+/// lists, spare scratch chunks, `crate::pool` staging blocks), so that a
+/// tester's log shows which build and switches ran.
+fn low_ram_line() {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if (last != 0 && now < last + 30_000)
+        || LAST.compare_exchange(last, now.max(1), Ordering::Relaxed, Ordering::Relaxed).is_err()
+    {
+        return;
+    }
+    let gib = |b: u64| b as f64 / f64::from(1u32 << 30);
+    let mib = |b: u64| b as f64 / f64::from(1u32 << 20);
+    let trim = allocator_trim().map_or_else(|| "off".to_owned(), |s| format!("every {s} s"));
+    tracing::info!(
+        "layer memory: PC {:.1} GB, low-RAM defaults {} (VICTORY_LOW_RAM=0 off, =1 on); allocator trim {trim} \
+         (VICTORY_ALLOCATOR_TRIM): {} list and {} prelude allocators taken anew, {} idle lists destroyed, \
+         {:.0} MB spare scratch freed since the start; {} host lists alive, {:.0} MB spare scratch kept; \
+         empty staging blocks kept at most {} (VICTORY_STAGING_KEEP)",
+        gib(crate::residency::total_ram().unwrap_or(0)),
+        if crate::residency::low_ram() { "on" } else { "off" },
+        ALLOCATOR_TRIMS[0].load(Ordering::Relaxed),
+        ALLOCATOR_TRIMS[1].load(Ordering::Relaxed),
+        crate::list::TRIMMED_LISTS.load(Ordering::Relaxed),
+        mib(SPARE_TRIMMED.load(Ordering::Relaxed)),
+        ALIVE[0].load(Ordering::Relaxed),
+        mib(ALIVE[4].load(Ordering::Relaxed)),
+        crate::pool::staging_kept(),
+    );
+}
+
 /// Whether a host list's prelude is made when the list first needs one. A
 /// prelude runs the texture transitions and twin copies a list needs before
 /// it; lists that name no texture never have one, and every host list was
@@ -1442,7 +1475,8 @@ fn lazy_prelude() -> bool {
 // patches 13 and 17.
 
 /// Whether host command allocators are taken anew now and then
-/// (`VICTORY_ALLOCATOR_TRIM=1`; off by default), and after how many
+/// (`VICTORY_ALLOCATOR_TRIM=1`; `=0` never; unset: on PCs low on RAM,
+/// [`crate::residency::low_ram`], off on others), and after how many
 /// seconds. A D3D12 command allocator never gives back the memory of the
 /// most its list ever recorded into it: a list that once took a loading
 /// frame's commands keeps that for the run, and upstream 1,600 of them
@@ -1459,7 +1493,8 @@ fn lazy_prelude() -> bool {
 pub(crate) fn allocator_trim() -> Option<u64> {
     static S: OnceLock<Option<u64>> = OnceLock::new();
     *S.get_or_init(|| {
-        std::env::var_os("VICTORY_ALLOCATOR_TRIM").is_some_and(|v| v == "1").then(|| {
+        let on = crate::residency::switch("VICTORY_ALLOCATOR_TRIM").unwrap_or_else(crate::residency::low_ram);
+        on.then(|| {
             std::env::var("VICTORY_ALLOCATOR_TRIM_S")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
@@ -9802,6 +9837,7 @@ impl Meter {
         crate::shadow::back_line(frames);
         submit_split_line(frames);
         fresh_open_line(frames);
+        low_ram_line();
         crate::heap_marks::line(frames);
         #[cfg(feature = "diagnostics")]
         split_line(frames);
