@@ -549,19 +549,21 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 ///
 /// Windows go there while a fifth of the card's budget is free, as with
 /// [`window_room_for`], which this comes before.
-fn window_mapped_most() -> u64 {
+fn window_mapped_most(host: &crate::host::Host) -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
         let set = std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
         let mb = set.unwrap_or_else(|| {
             let ram = crate::residency::total_host_ram();
-            let mb = windows_bar_default_mb(ram);
+            let vram = host.card_own_memory();
+            let mb = windows_bar_default_mb(ram, vram);
             if mb > 0 {
                 tracing::info!(
                     ram_gb = ram.unwrap_or(0) >> 30,
+                    vram_mb = vram.unwrap_or(0) >> 20,
                     mb,
-                    "under 24 GB of RAM: title memory windows in the card's memory the CPU maps \
-                     (VICTORY_WINDOWS_BAR_MB=0 turns this off)"
+                    "under 24 GB of RAM: title memory windows in the card's memory the CPU maps, \
+                     scaled to the card (VICTORY_WINDOWS_BAR_MB sets it by hand, 0 turns it off)"
                 );
             }
             mb
@@ -571,15 +573,23 @@ fn window_mapped_most() -> u64 {
 }
 
 /// [`window_mapped_most`] in MiB when `VICTORY_WINDOWS_BAR_MB` is not set, for a
-/// PC with `ram` bytes of RAM: 3072 under 24 GB (PR #6), else 0. Windows lets a
+/// PC with `ram` bytes of RAM and a card with `vram` bytes of its own: under
+/// 24 GB of RAM, 3072 on a 12 GB card or larger (PR #6), 1024 on an 8 GB card
+/// or smaller, and 512 more for each GB between (2048 on 10 GB), so small cards
+/// keep their memory for textures; a card of unknown size gets 1024. 24 GB of
+/// RAM and more, or RAM that can't be read: 0. Windows lets a
 /// card share at most half the RAM, and the windows filled that on a 16 GB PC
 /// (RTX 3060) about a minute into the world: 0x8007000E, then a driver fault.
-/// 32 GB and more never got there. RAM that can't be read: 0.
-fn windows_bar_default_mb(ram: Option<u64>) -> u64 {
+/// 32 GB and more never got there. The windows only go there while the card is
+/// under 80 % of its budget either way ([`window_mapped_for`]).
+fn windows_bar_default_mb(ram: Option<u64>, vram: Option<u64>) -> u64 {
     match ram {
-        Some(ram) if ram > 0 && ram < 24 << 30 => 3072,
-        _ => 0,
+        Some(ram) if ram > 0 && ram < 24 << 30 => {}
+        _ => return 0,
     }
+    // The card's size in whole GB, rounded (a 12 GB card reports a little under 12 GiB).
+    let Some(gb) = vram.filter(|&v| v > 0).map(|v| (v + (512 << 20)) >> 30) else { return 1024 };
+    1024 + (gb.clamp(8, 12) - 8) * 512
 }
 
 /// Bytes alive of windows in card memory the CPU maps.
@@ -588,11 +598,11 @@ static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-    let most = window_mapped_most();
+    let host = host()?;
+    let most = window_mapped_most(host);
     if most == 0 {
         return None;
     }
-    let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
         && used + size > budget / 10 * 8
     {
@@ -6175,12 +6185,29 @@ mod windows_bar_tests {
     use super::windows_bar_default_mb;
 
     #[test]
-    fn under_24_gb_of_ram_gets_3_gb_of_mapped_windows() {
-        assert_eq!(windows_bar_default_mb(Some(16 << 30)), 3072);
-        assert_eq!(windows_bar_default_mb(Some((24 << 30) - 1)), 3072);
-        assert_eq!(windows_bar_default_mb(Some(24 << 30)), 0);
-        assert_eq!(windows_bar_default_mb(Some(32 << 30)), 0);
-        assert_eq!(windows_bar_default_mb(Some(0)), 0);
-        assert_eq!(windows_bar_default_mb(None), 0);
+    fn under_24_gb_of_ram_the_mapped_windows_scale_with_the_card() {
+        const GB: u64 = 1 << 30;
+        const MB: u64 = 1 << 20;
+        let ram = Some(16 * GB);
+        // 12 GB and up: 3 GB, as a 12 GB card reports itself (12,010 MB) too
+        assert_eq!(windows_bar_default_mb(ram, Some(12_010 * MB)), 3072);
+        assert_eq!(windows_bar_default_mb(ram, Some(16 * GB)), 3072);
+        assert_eq!(windows_bar_default_mb(ram, Some(24 * GB)), 3072);
+        // between: 512 MB more for each GB over 8
+        assert_eq!(windows_bar_default_mb(ram, Some(10 * GB)), 2048);
+        assert_eq!(windows_bar_default_mb(ram, Some(11 * GB)), 2560);
+        // 8 GB and under: 1 GB
+        assert_eq!(windows_bar_default_mb(ram, Some(8 * GB)), 1024);
+        assert_eq!(windows_bar_default_mb(ram, Some(6 * GB)), 1024);
+        assert_eq!(windows_bar_default_mb(ram, Some(4 * GB)), 1024);
+        // a card of unknown size: 1 GB
+        assert_eq!(windows_bar_default_mb(ram, None), 1024);
+        assert_eq!(windows_bar_default_mb(ram, Some(0)), 1024);
+        // 24 GB of RAM and up, or RAM that can't be read: none
+        assert_eq!(windows_bar_default_mb(Some((24 * GB) - 1), Some(12 * GB)), 3072);
+        assert_eq!(windows_bar_default_mb(Some(24 * GB), Some(12 * GB)), 0);
+        assert_eq!(windows_bar_default_mb(Some(32 * GB), Some(8 * GB)), 0);
+        assert_eq!(windows_bar_default_mb(Some(0), Some(12 * GB)), 0);
+        assert_eq!(windows_bar_default_mb(None, Some(12 * GB)), 0);
     }
 }
