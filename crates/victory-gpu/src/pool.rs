@@ -35,6 +35,21 @@ const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
 const STAGING_KEPT: usize = 8;
+/// The same on PCs low on RAM ([`crate::residency::low_ram`]): 128 MiB.
+const STAGING_KEPT_LOW: usize = 2;
+/// How many empty staging blocks are kept at most: `VICTORY_STAGING_KEEP`
+/// (0 to [`STAGING_KEPT`]), else [`STAGING_KEPT_LOW`] on PCs low on RAM and
+/// [`STAGING_KEPT`] on others. Each one is 64 MiB of the PC's memory.
+pub(crate) fn staging_kept() -> usize {
+    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_KEEP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.min(STAGING_KEPT))
+            .unwrap_or(if crate::residency::low_ram() { STAGING_KEPT_LOW } else { STAGING_KEPT })
+    })
+}
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
@@ -527,7 +542,10 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
+    let mut pool = lock(&STAGING);
+    // At most [`staging_kept`] empty blocks stay, whatever the card's room.
+    pool.most = staging_kept();
+    let taken = pool.take(bytes, 512, now(), || {
         // Only gate speculative bindless prefetch on staging-pool growth
         // headroom; table-bound textures and decoration bakes are sampled
         // immediately and would otherwise read uninitialized/reused VRAM.
@@ -538,7 +556,9 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         let (buffer, data) = host.upload_buffer(BLOCK)?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
-    })?;
+    });
+    drop(pool);
+    let (piece, memory, again) = taken?;
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
