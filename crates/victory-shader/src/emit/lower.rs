@@ -359,6 +359,20 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// With `exchange` and [`super::barrier_trim`]: the first of two more pairs of exchange
+    /// dwords per console wave, and this thread's first (made in the entry block). Only the
+    /// exchanges of [`Self::exchange_halves`] that take turns use them; every other use of
+    /// exchange dwords keeps to the first pair and its own two barriers.
+    second: Option<u32>,
+    pair2: Option<V>,
+    /// Lane exchanges take the two pairs in turn while a block (its instructions and its exit)
+    /// is lowered; `owed`: the pair (0, 1) whose reads may still wait for the barrier that lets
+    /// it be written again ([`Self::exchange_halves`], [`Self::settle_exchanges`]). Pair 0 is
+    /// free wherever a block starts, so a block starts with pair 1 owed.
+    trim_exchanges: bool,
+    owed: Option<u8>,
+    /// With `split_lds` and [`super::barrier_trim`]: what LDS saw since the group last met.
+    lds_since: LdsSince,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -1507,6 +1521,20 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's [`super::barrier_trim`], for its thread only.
+    pub(super) static TEST_BARRIER_TRIM: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// With `split_lds` ([`super::barrier_trim`]): what the title's LDS saw since the last barrier
+/// the whole group waited at, in the IR block being lowered.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LdsSince {
+    /// Nothing: a meeting now would order nothing.
+    Met,
+    /// Reads only: a read needs no meeting before it.
+    Reads,
+    /// A write, an atomic, or what came before the block (not known here).
+    Written,
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1744,6 +1772,10 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // with `exchange` and the group meeting as one: two more pairs of exchange dwords per
+        // console wave, which the exchanges of a block every lane runs take in turn
+        // (`barrier_trim`)
+        let mut second: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         // console lanes in a group of several host waves: the LDS dword of `wave_base`'s counter
@@ -1904,6 +1936,15 @@ impl<'a> Lower<'a> {
                 // the flat id rounded down is not a host wave's base on every host (#1243)
                 ticket = Some(s.lds_dwords);
                 s.lds_dwords += 1;
+            }
+            if exchange.as_ref().is_some_and(|e| !e.1)
+                && pairs.is_none()
+                && !LOCAL_WAVES.get()
+                && super::barrier_trim()
+                && s.lds_dwords + 4 * group.div_ceil(64) <= HOST_LDS_DWORDS
+            {
+                second = Some(s.lds_dwords);
+                s.lds_dwords += 4 * group.div_ceil(64);
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -2076,6 +2117,11 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            second,
+            pair2: None,
+            trim_exchanges: false,
+            owed: None,
+            lds_since: LdsSince::Written,
             halves,
             ticket,
             wave_base: None,
@@ -2793,9 +2839,14 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            // (what LDS saw before the block is not known here; of the pairs that exchanges
+            // take in turn, only pair 0 is known free)
+            self.lds_since = LdsSince::Written;
+            self.owed = Some(1);
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
+            self.trim_exchanges = self.second.is_some();
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
@@ -4655,6 +4706,8 @@ impl<'a> Lower<'a> {
         self.s.m.set_phi(n, vec![(zero, c), (n1, wait)]);
         self.cur = done;
         self.s.op(done, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+        // (the two halves met: their LDS order is kept, whatever the other console waves do)
+        self.lds_since = LdsSince::Met;
     }
 
     /// With `pairs`: the LDS dword of this console wave's meeting counter (made in the entry
@@ -4748,6 +4801,11 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        if block == self.cur && super::group_sync() != 0 {
+            // (every thread of the group waits here: what came before is ordered)
+            self.owed = None;
+            self.lds_since = LdsSince::Met;
+        }
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -4780,8 +4838,25 @@ impl<'a> Lower<'a> {
             }
             return Ok(self.exchange_pairs(&[mine])[0]);
         }
+        // (`barrier_trim`: where the code is being lowered, in a block every lane runs, the
+        // exchanges take the two pairs in turn, each the one no thread may still read: pair 1
+        // unless that is owed. The barrier after this one's reads is the next exchange's
+        // first, which comes before the next write of this pair, or the one
+        // [`Self::settle_exchanges`] places at the block's end when pair 0 is owed there.)
+        let turn = if self.trim_exchanges && at == self.cur && self.all_lanes(self.cur_ir) {
+            self.second.map(|_| if self.owed == Some(1) { 0 } else { 1 })
+        } else {
+            None
+        };
         // the pair of dwords of this thread's console wave: its half's, then both
-        let pair = self.exchange_pair(slot);
+        let pair = match turn {
+            Some(t) => {
+                let base = self.exchange_pair2();
+                let k = self.s.m.i32(2 * u32::from(t));
+                self.s.m.bin(at, Bin::Add, base, k)
+            }
+            None => self.exchange_pair(slot),
+        };
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
@@ -4796,9 +4871,45 @@ impl<'a> Lower<'a> {
         let p1 = self.s.m.element(at, lds, k1);
         let lo = self.s.m.load(at, p0);
         let hi = self.s.m.load(at, p1);
-        // the slots are written again only after every thread read them
-        self.group_sync(at);
+        if let Some(t) = turn {
+            // (the barrier above stands for the one the other pair still waited for)
+            self.owed = Some(t);
+        } else {
+            // the slots are written again only after every thread read them
+            self.group_sync(at);
+        }
         Ok((lo, hi))
+    }
+
+    /// At a block's end, before its exit's branch: with pair 0 [`Self::owed`], the barrier
+    /// after its last reads, in [`Self::cur`] (pair 0 is owed only after an exchange of this
+    /// block, which every lane runs, and its end is outside any lane guard). The next block,
+    /// or the next pass of a loop, finds pair 0 free; pair 1 may still be owed, and a block's
+    /// first exchange writes pair 0, whose barrier frees pair 1 for the next.
+    fn settle_exchanges(&mut self) {
+        if self.owed == Some(0) {
+            let c = self.cur;
+            self.group_sync(c);
+        }
+        self.owed = None;
+    }
+
+    /// The first of the two pairs that turns take ([`Self::second`]) of this thread's console
+    /// wave (made in the entry block): four dwords a console wave.
+    fn exchange_pair2(&mut self) -> V {
+        if let Some(v) = self.pair2 {
+            return v;
+        }
+        let e = self.s.entry;
+        let thread = self.console_thread();
+        let six = self.s.m.i32(6);
+        let wave = self.s.m.bin(e, Bin::LShr, thread, six);
+        let two = self.s.m.i32(2);
+        let four = self.s.m.bin(e, Bin::Shl, wave, two);
+        let base = self.s.m.i32(self.second.expect("the pairs that take turns"));
+        let v = self.s.m.bin(e, Bin::Add, base, four);
+        self.pair2 = Some(v);
+        v
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -6121,9 +6232,11 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
-        if self.split_lds
+        let title_lds = self.split_lds
             && matches!(inst.fields, Fields::Ds { .. })
-            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+            && !(name.starts_with("ds_swizzle") || name.contains("permute"));
+        let reads_only = name.starts_with("ds_read");
+        if title_lds
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
             && !self.lds_unordered.contains(&(b, i))
         {
@@ -6131,11 +6244,28 @@ impl<'a> Lower<'a> {
                 // (in a loop the host waves take each on its own: a fence, no wait)
                 let (fence, void) = (self.s.m.i32(8), self.s.t.void);
                 self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
+            } else if super::barrier_trim()
+                && match self.lds_since {
+                    LdsSince::Met => true,
+                    LdsSince::Reads => reads_only,
+                    LdsSince::Written => false,
+                }
+            {
+                // (`barrier_trim`: since the halves last met, in this block, no access, or
+                // reads only and this one reads: a meeting here would order nothing that
+                // counts, as reads see the same values in any order)
             } else {
                 // the two host waves of a console wave meet before each LDS access: what the
                 // other half wrote is visible, and what it still reads is not overwritten
                 self.meet();
             }
+        }
+        if title_lds {
+            // (every access counts here, also those that need no meeting of their own)
+            self.lds_since = match self.lds_since {
+                LdsSince::Met | LdsSince::Reads if reads_only => LdsSince::Reads,
+                _ => LdsSince::Written,
+            };
         }
         // The structure builder's threads take turns through atomics (a tree
         // built from its leaves up): what one wrote before its atomic is
@@ -6170,6 +6300,11 @@ impl<'a> Lower<'a> {
                 let void = self.s.t.void;
                 self.s
                     .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                if waits && !self.fence_only.contains(&b) {
+                    // (the whole group waits here, as at a meeting)
+                    self.lds_since = LdsSince::Met;
+                    self.owed = None;
+                }
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -13388,6 +13523,10 @@ impl<'a> Lower<'a> {
             LaneExit::Indirect => return Err(unsupported(offset, "an indirect jump")),
         };
         let _ = Exit::End;
+        if self.trim_exchanges {
+            self.settle_exchanges();
+            self.trim_exchanges = false;
+        }
         // (the exit's own code may have moved on to a new block: the halves of a console wave
         // meeting for a wave-wide branch, [`Self::meet`]; the edges out leave from there)
         self.tail[b] = Some(self.cur);
