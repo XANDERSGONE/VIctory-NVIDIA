@@ -4988,8 +4988,9 @@ impl State {
                 // the world streams a change is under way most of the time,
                 // and this is the thread that submits.
                 let mut read = vec![0u8; n * 3 * stride];
-                let held = (!crate::host::read_into(from as *const u8, &mut read))
-                    .then(|| crate::watch::title_memory_reading_range(from..from + n * 3 * stride));
+                // (All of title memory: a read in place may fault into a view
+                // kept in the books, `crate::watch::mapping_ranges`.)
+                let held = (!crate::host::read_into(from as *const u8, &mut read)).then(crate::watch::title_memory_reading);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {

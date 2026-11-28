@@ -201,10 +201,12 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 pub(crate) fn land(back: &Back) {
     static COPIED: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
-    // (Of the texture's own memory alone: a change of mapping elsewhere does
-    // not make its ticket stale.)
-    let (at, end) = back.range();
-    let _mapping = crate::watch::title_memory_reading_range(at..end);
+    // All of title memory, not the texture's range alone: the write below
+    // may make a view kept in the books real (`crate::host::copy_mapped`),
+    // which waits for the record of views, and a change of other memory
+    // that held it would wait for the tickets held here
+    // (`crate::watch::mapping_ranges`).
+    let _mapping = crate::watch::title_memory_reading();
     let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
     if !back.ticket.valid.load(Ordering::Acquire) {
         let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -213,6 +215,7 @@ pub(crate) fn land(back: &Back) {
         }
         return;
     }
+    let (at, end) = back.range();
     let size = end - at;
     let mut tiled = vec![0u8; size];
     // Keep title bytes the subresources do not cover.
