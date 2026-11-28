@@ -5027,7 +5027,10 @@ mod mapping_tests {
             });
             assert_eq!(ended.recv_timeout(if waits { wait } else { ahead }).is_err(), waits);
             drop(reading);
-            ended.recv().unwrap();
+            // (A change that went ahead has already said so above.)
+            if waits {
+                ended.recv().unwrap();
+            }
             change.join().unwrap();
         }
         // A change of one range: a read of another begins, at once or not;
